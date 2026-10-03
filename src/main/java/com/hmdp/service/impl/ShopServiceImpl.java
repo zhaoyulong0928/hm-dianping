@@ -44,7 +44,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     @Override
     public Result queryById(Long id) {
-        // 解决缓存穿透
+        // 解决缓存穿透， （被动）缓存空对象，布隆过滤。（主动）增强id的复杂度，避免被猜测id规律，做好数据的基础格式校验，加强用户权限校验，做好热点参数限流
         Shop shop = cacheClient
                 .queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
 
