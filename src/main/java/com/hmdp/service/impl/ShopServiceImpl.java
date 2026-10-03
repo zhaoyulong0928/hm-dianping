@@ -17,9 +17,13 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.domain.geo.GeoReference;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import javax.annotation.Resource;
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 import static com.hmdp.utils.RedisConstants.*;
@@ -41,6 +45,13 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     @Resource
     private CacheClient cacheClient;
+
+    /** 延迟删除专用线程池：执行"第二次删除"，避免阻塞业务线程 */
+    private static final ScheduledExecutorService DELAY_DELETE_EXECUTOR =
+            Executors.newScheduledThreadPool(2);
+
+    /** 延迟双删的间隔：需大于"读线程查库 + 回写缓存"的耗时 */
+    private static final long DELAY_DELETE_MILLIS = 500L;
 
     @Override
     public Result queryById(Long id) {
@@ -70,10 +81,21 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if (id == null) {
             return Result.fail("店铺id不能为空");
         }
-        // 1.更新数据库
+        // 1.只更新数据库，此时事务尚未提交
         updateById(shop);
-        // 2.删除缓存
-        stringRedisTemplate.delete(CACHE_SHOP_KEY + id);
+        // 2.把删缓存注册到"事务提交之后"执行，保证先提交、再删缓存
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                String key = CACHE_SHOP_KEY + id;
+                // 第一次删除：清掉缓存中的旧值
+                stringRedisTemplate.delete(key);
+                // 第二次删除（延迟）：兜住"提交前读到旧值、删除后才回写"的脏数据
+                DELAY_DELETE_EXECUTOR.schedule(
+                        () -> stringRedisTemplate.delete(key),
+                        DELAY_DELETE_MILLIS, TimeUnit.MILLISECONDS);
+            }
+        });
         return Result.ok();
     }
 
