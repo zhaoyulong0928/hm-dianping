@@ -1,0 +1,65 @@
+# 黑马点评（改造版）
+
+> 基于黑马程序员《Redis 实战篇》教程项目「黑马点评」进行二次开发。
+> `master` 分支保留教程原版基线，改造内容在 `feature/refactor` 分支上进行。
+
+## 项目简介
+
+一个本地生活服务类应用的后端，提供商户查询、优惠券秒杀、探店笔记、好友关注、附近商铺等功能，重点实践 Redis 的各类应用场景。
+
+## 技术栈
+
+| 分类 | 技术 |
+| --- | --- |
+| 语言 / 框架 | Java 8、Spring Boot、MyBatis-Plus |
+| 数据库 | MySQL 8 |
+| 缓存 / 中间件 | Redis（String / Hash / Set / ZSet / GEO / Stream）、Redisson |
+| 其他 | Nginx（静态资源 + 反向代理）、Lua 脚本 |
+
+## 功能模块
+
+- **登录认证**：验证码 + Redis Token + 双拦截器，实现无状态会话
+- **商户查询缓存**：缓存穿透 / 击穿 / 雪崩的处理，Cache Aside 更新策略
+- **优惠券秒杀**：Lua 脚本 + 分布式锁 + 消息队列异步下单
+- **探店笔记 / 好友关注**：点赞、关注、Feed 流
+- **附近商铺**：基于 Redis GEO 的距离排序与分页
+
+## 环境要求
+
+- JDK 8+
+- MySQL 8（库名 `hmdp`，建表与数据脚本见 `src/main/resources/db/hmdp.sql`）
+- Redis 6+
+- Nginx（前端静态资源，可选）
+
+## 本地启动
+
+1. 导入数据库：执行 `src/main/resources/db/hmdp.sql`
+2. 按需修改 `src/main/resources/application.yaml` 中的 MySQL / Redis 连接信息
+3. 启动 `HmDianPingApplication`（默认端口 `8081`）
+4. 前端：Nginx 监听 `8080`，`/api/` 反向代理到 `8081`
+
+## 分支说明
+
+| 分支 / 标签 | 说明 |
+| --- | --- |
+| `master` | 教程原版基线 |
+| `v1-course-original` | 原版快照标签，可随时对比 / 回滚 |
+| `feature/refactor` | 改造分支（当前开发分支） |
+
+对比改造内容：
+
+```bash
+git diff master feature/refactor
+```
+
+## 改造计划
+
+> 随着改造推进持续更新。
+
+- [ ] 待补充
+
+## 改造记录
+
+| 日期 | 内容 |
+| --- | --- |
+| - | - |
