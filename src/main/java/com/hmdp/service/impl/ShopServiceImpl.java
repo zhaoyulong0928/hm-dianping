@@ -20,10 +20,10 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import javax.annotation.PreDestroy;
 import javax.annotation.Resource;
 import java.util.*;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 import static com.hmdp.utils.RedisConstants.*;
@@ -47,11 +47,21 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     private CacheClient cacheClient;
 
     /** 延迟删除专用线程池：执行"第二次删除"，避免阻塞业务线程 */
-    private static final ScheduledExecutorService DELAY_DELETE_EXECUTOR =
-            Executors.newScheduledThreadPool(2);
+    private static final ScheduledThreadPoolExecutor DELAY_DELETE_EXECUTOR =
+            createDelayDeleteExecutor();
 
     /** 延迟双删的间隔：需大于"读线程查库 + 回写缓存"的耗时 */
     private static final long DELAY_DELETE_MILLIS = 500L;
+
+    /** 创建延迟删除线程池：核心线程空闲 60s 后被回收，避免长期占用 */
+    private static ScheduledThreadPoolExecutor createDelayDeleteExecutor() {
+        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(2);
+        // 核心线程空闲存活时间
+        executor.setKeepAliveTime(60L, TimeUnit.SECONDS);
+        // 允许核心线程超时回收（默认 false，核心线程永不回收）
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
+    }
 
     @Override
     public Result queryById(Long id) {
@@ -97,6 +107,20 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             }
         });
         return Result.ok();
+    }
+
+    /** 应用关闭时优雅停止线程池：等待未执行的延迟删除任务执行完 */
+    @PreDestroy
+    public void shutdownDelayDeleteExecutor() {
+        DELAY_DELETE_EXECUTOR.shutdown();
+        try {
+            if (!DELAY_DELETE_EXECUTOR.awaitTermination(5, TimeUnit.SECONDS)) {
+                DELAY_DELETE_EXECUTOR.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            DELAY_DELETE_EXECUTOR.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Override
