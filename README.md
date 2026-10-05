@@ -58,6 +58,7 @@ git diff master feature/refactor
 
 - [x] 商户缓存更新改为「事务提交后删缓存 + 延迟双删」
 - [x] 延迟删除线程池支持「闲时回收 + 优雅关闭」
+- [x] 修复秒杀订单消息 ACK 的 stream 名称错误（`s1` → `stream.orders`）
 
 ## 改造记录
 
@@ -65,3 +66,4 @@ git diff master feature/refactor
 | --- | --- |
 | 2026-10-03 | 商户 `update` 改为「事务提交后删缓存 + 延迟双删」（`ShopServiceImpl`） |
 | 2026-10-04 | 延迟删除线程池增加「闲时回收（`allowCoreThreadTimeOut`）+ 优雅关闭（`@PreDestroy`）」（`ShopServiceImpl`） |
+| 2026-10-05 | 修复秒杀订单消息 ACK 的 stream 名称错误（`s1` → `stream.orders`），避免 pending 消息堆积（`VoucherOrderServiceImpl`） |
