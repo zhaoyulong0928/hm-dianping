@@ -59,6 +59,7 @@ git diff master feature/refactor
 - [x] 商户缓存更新改为「事务提交后删缓存 + 延迟双删」
 - [x] 延迟删除线程池支持「闲时回收 + 优雅关闭」
 - [x] 修复秒杀订单消息 ACK 的 stream 名称错误（`s1` → `stream.orders`）
+- [x] 秒杀开始/结束时间校验下沉到 Redis Lua（避免秒杀请求查数据库）
 
 ## 改造记录
 
@@ -67,3 +68,4 @@ git diff master feature/refactor
 | 2026-10-03 | 商户 `update` 改为「事务提交后删缓存 + 延迟双删」（`ShopServiceImpl`） |
 | 2026-10-04 | 延迟删除线程池增加「闲时回收（`allowCoreThreadTimeOut`）+ 优雅关闭（`@PreDestroy`）」（`ShopServiceImpl`） |
 | 2026-10-05 | 修复秒杀订单消息 ACK 的 stream 名称错误（`s1` → `stream.orders`），避免 pending 消息堆积（`VoucherOrderServiceImpl`） |
+| 2026-10-09 | 秒杀增加开始/结束时间校验：起止时间写入 Redis，由 `seckill.lua` 判断；并修复库存 key 不存在时 `tonumber(nil)` 报错的容错（`VoucherServiceImpl` / `seckill.lua` / `VoucherOrderServiceImpl` / `RedisConstants`） |

@@ -49,8 +49,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
+    //作用是加载lua脚本，用于秒杀，lua脚本中不能直接操作全局变量，只能操作局部变量，所以需要将参数赋值给局部变量
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
 
+    // 放在静态代码块里面，确保在类加载时加载lua脚本，避免在运行时加载lua脚本，导致性能问题
     static {
         SECKILL_SCRIPT = new DefaultRedisScript<>();
         SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
@@ -189,18 +191,27 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     @Override
     public Result seckillVoucher(Long voucherId) {
+        // 1.获取用户id
         Long userId = UserHolder.getUser().getId();
+        // 1.1生成订单id
         long orderId = redisIdWorker.nextId("order");
-        // 1.执行lua脚本
+        // 1.2.执行lua脚本
         Long result = stringRedisTemplate.execute(
                 SECKILL_SCRIPT,
                 Collections.emptyList(),
                 voucherId.toString(), userId.toString(), String.valueOf(orderId)
         );
+        // 1.3.将结果转换为int类型，intValue()方法是将Long类型转换为int类型
         int r = result.intValue();
         // 2.判断结果是否为0
         if (r != 0) {
             // 2.1.不为0 ，代表没有购买资格
+            if (r == 3) {
+                return Result.fail("秒杀尚未开始");
+            }
+            if (r == 4) {
+                return Result.fail("秒杀已经结束");
+            }
             return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
         }
         // 3.返回订单id
@@ -214,7 +225,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         Long result = stringRedisTemplate.execute(
                 SECKILL_SCRIPT,
                 Collections.emptyList(),
-                voucherId.toString(), userId.toString()
+                voucherId.toString(), userId.toString(), String.valueOf(orderId)
         );
         int r = result.intValue();
         // 2.判断结果是否为0
