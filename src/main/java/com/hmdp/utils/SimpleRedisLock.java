@@ -10,21 +10,24 @@ import java.util.concurrent.TimeUnit;
 
 public class SimpleRedisLock implements ILock {
 
-    private String name;
-    private StringRedisTemplate stringRedisTemplate;
+    private String name;// 锁名称，用于生成锁键名
+    private StringRedisTemplate stringRedisTemplate;// Redis 模板，用于操作 Redis 数据库
 
+    /** 构造函数，初始化锁名称和 Redis 模板 */
     public SimpleRedisLock(String name, StringRedisTemplate stringRedisTemplate) {
         this.name = name;
         this.stringRedisTemplate = stringRedisTemplate;
     }
 
+    
     private static final String KEY_PREFIX = "lock:";
+    //使用UUID避免线程ID冲突，确保每个线程的标示都是唯一的
     private static final String ID_PREFIX = UUID.randomUUID().toString(true) + "-";
-    private static final DefaultRedisScript<Long> UNLOCK_SCRIPT;
-    static {
-        UNLOCK_SCRIPT = new DefaultRedisScript<>();
-        UNLOCK_SCRIPT.setLocation(new ClassPathResource("unlock.lua"));
-        UNLOCK_SCRIPT.setResultType(Long.class);
+    private static final DefaultRedisScript<Long> UNLOCK_SCRIPT;   // ① 声明静态常量（还没赋值）
+    static {                                                        // ② 静态初始化块
+        UNLOCK_SCRIPT = new DefaultRedisScript<>();                 // ③ 创建脚本对象
+        UNLOCK_SCRIPT.setLocation(new ClassPathResource("unlock.lua")); // ④ 指定脚本文件
+        UNLOCK_SCRIPT.setResultType(Long.class);                    // ⑤ 指定返回值类型
     }
 
     @Override
@@ -39,7 +42,7 @@ public class SimpleRedisLock implements ILock {
 
     @Override
     public void unlock() {
-        // 调用lua脚本
+        // 调用lua脚本的作用是释放锁
         stringRedisTemplate.execute(
                 UNLOCK_SCRIPT,
                 Collections.singletonList(KEY_PREFIX + name),
