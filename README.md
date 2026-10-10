@@ -13,14 +13,14 @@
 | --- | --- |
 | 语言 / 框架 | Java 8、Spring Boot、MyBatis-Plus |
 | 数据库 | MySQL 8 |
-| 缓存 / 中间件 | Redis（String / Hash / Set / ZSet / GEO / Stream）、Redisson |
+| 缓存 / 中间件 | Redis（String / Hash / Set / ZSet / GEO / Stream）、Redisson、RabbitMQ |
 | 其他 | Nginx（静态资源 + 反向代理）、Lua 脚本 |
 
 ## 功能模块
 
 - **登录认证**：验证码 + Redis Token + 双拦截器，实现无状态会话
 - **商户查询缓存**：缓存穿透 / 击穿 / 雪崩的处理，Cache Aside 更新策略
-- **优惠券秒杀**：Lua 脚本 + 分布式锁 + 消息队列异步下单
+- **优惠券秒杀**：Lua 脚本原子校验 + 分布式锁 + RabbitMQ 消息队列异步下单
 - **探店笔记 / 好友关注**：点赞、关注、Feed 流
 - **附近商铺**：基于 Redis GEO 的距离排序与分页
 
@@ -29,6 +29,7 @@
 - JDK 8+
 - MySQL 8（库名 `hmdp`，建表与数据脚本见 `src/main/resources/db/hmdp.sql`）
 - Redis 6+
+- RabbitMQ 3.x（秒杀异步下单，默认 `localhost:5672`，账号密码 `guest/guest`）
 - Nginx（前端静态资源，可选）
 
 ## 本地启动
@@ -60,6 +61,7 @@ git diff master feature/refactor
 - [x] 延迟删除线程池支持「闲时回收 + 优雅关闭」
 - [x] 修复秒杀订单消息 ACK 的 stream 名称错误（`s1` → `stream.orders`）
 - [x] 秒杀开始/结束时间校验下沉到 Redis Lua（避免秒杀请求查数据库）
+- [x] 秒杀异步下单由 Redis Stream 迁移到 RabbitMQ（可靠投递 + 并发消费 + 死信队列 + 唯一索引幂等）
 
 ## 改造记录
 
@@ -69,3 +71,4 @@ git diff master feature/refactor
 | 2026-10-04 | 延迟删除线程池增加「闲时回收（`allowCoreThreadTimeOut`）+ 优雅关闭（`@PreDestroy`）」（`ShopServiceImpl`） |
 | 2026-10-05 | 修复秒杀订单消息 ACK 的 stream 名称错误（`s1` → `stream.orders`），避免 pending 消息堆积（`VoucherOrderServiceImpl`） |
 | 2026-10-09 | 秒杀增加开始/结束时间校验：起止时间写入 Redis，由 `seckill.lua` 判断；并修复库存 key 不存在时 `tonumber(nil)` 报错的容错（`VoucherServiceImpl` / `seckill.lua` / `VoucherOrderServiceImpl` / `RedisConstants`） |
+| 2026-10-10 | 秒杀异步下单由 Redis Stream 迁移到 RabbitMQ：publisher confirm + 消息持久化 + 失败重试 3 次进死信 + 并发消费（`concurrency`）+ `(user_id, voucher_id)` 唯一索引幂等兜底（新增 `RabbitMQConfig` / `MqConstants` / `SeckillOrderMsg`，改造 `VoucherOrderServiceImpl` / `seckill.lua` / `application.yaml` / `hmdp.sql`） |

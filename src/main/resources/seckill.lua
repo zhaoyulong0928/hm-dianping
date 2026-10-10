@@ -44,6 +44,5 @@ end
 redis.call('incrby', stockKey, -1)
 -- 4.6.下单（保存用户）sadd orderKey userId
 redis.call('sadd', orderKey, userId)
--- 4.7.发送消息到队列中， XADD stream.orders * k1 v1 k2 v2 ...
-redis.call('xadd', 'stream.orders', '*', 'userId', userId, 'voucherId', voucherId, 'id', orderId)
+-- 4.7.秒杀成功返回0（下单消息改由 Java 侧投递到 RabbitMQ）
 return 0

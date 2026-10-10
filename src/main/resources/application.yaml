@@ -17,6 +17,16 @@ spring:
         max-idle: 10
         min-idle: 1
         time-between-eviction-runs: 10s
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    virtual-host: /
+    # 发送方确认：消息是否成功投递到 broker
+    publisher-confirm-type: correlated
+    # 开启失败回退：消息无法路由到队列时触发 ReturnsCallback
+    publisher-returns: true
   jackson:
     default-property-inclusion: non_null
 mybatis-plus:
