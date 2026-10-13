@@ -88,9 +88,23 @@ public class CacheClient {
         String key = keyPrefix + id;
         // 1.从redis查询商铺缓存
         String json = stringRedisTemplate.opsForValue().get(key);
-        // 2.判断是否存在（逻辑过期方案依赖预热，未命中直接视为不存在）
+        // 2.缓存未命中（如被延迟双删清除）：查库自愈并回填，不能直接视为不存在
         if (StrUtil.isBlank(json)) {
-            return null;
+            R r = dbFallback.apply(id);
+            if (r == null) {
+                // 数据库中也不存在，才返回未找到
+                return null;
+            }
+            // 加锁防止删除瞬间多线程同时查库回填；抢锁失败说明已有线程在回填，直接返回即可
+            RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
+            if (lock.tryLock()) {
+                try {
+                    this.setWithLogicalExpire(key, r, time, unit);
+                } finally {
+                    lock.unlock();
+                }
+            }
+            return r;
         }
         // 3.命中，先把json反序列化为对象
         RedisData redisData = JSONUtil.toBean(json, RedisData.class);

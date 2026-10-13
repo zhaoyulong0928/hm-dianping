@@ -64,6 +64,7 @@ git diff master feature/refactor
 - [x] 秒杀异步下单由 Redis Stream 迁移到 RabbitMQ（可靠投递 + 并发消费 + 死信队列 + 唯一索引幂等）
 - [x] 缓存重建锁改用 Redisson `RLock`（修复自研锁误删他人锁的隐患）
 - [x] 互斥锁方案改为「有界重试 + 降级」（消除无限递归重试，避免请求线程被长时间占用）
+- [x] 商户缓存读路径切换为逻辑过期方案：启动预热全量商铺 + 缓存 miss 查库自愈回填
 
 ## 改造记录
 
@@ -76,3 +77,4 @@ git diff master feature/refactor
 | 2026-10-10 | 秒杀异步下单由 Redis Stream 迁移到 RabbitMQ：publisher confirm + 消息持久化 + 失败重试 3 次进死信 + 并发消费（`concurrency`）+ `(user_id, voucher_id)` 唯一索引幂等兜底（新增 `RabbitMQConfig` / `MqConstants` / `SeckillOrderMsg`，改造 `VoucherOrderServiceImpl` / `seckill.lua` / `application.yaml` / `hmdp.sql`） |
 | 2026-10-13 | 缓存重建锁改用 Redisson `RLock`，修复原自研锁「释放不校验持有者、极端场景误删他人锁」的隐患（避免缓存击穿时多个线程同时打库）；逻辑过期方案将「拿锁 + 重建 + 释放锁」收敛到同一异步线程，规避 Redisson 锁跨线程释放报错（`CacheClient`） |
 | 2026-10-13 | 互斥锁方案消除无限递归重试：改为「抢锁失败等待 30~50ms 重查缓存，最多重试 3 次，仍失败抛 `CacheBusyException` 降级」；抢锁成功后先 double-check 缓存避免重复查库；中断时恢复标记并快速降级（`CacheClient` / `RedisConstants`，新增 `CacheBusyException` 及全局降级响应） |
+| 2026-10-13 | 商户缓存读路径切换为逻辑过期方案：新增 `ShopCachePreloader` 启动预热（`ApplicationRunner` 全量商铺写入逻辑过期缓存）；修复「延迟双删物理删除 key 后，逻辑过期 miss 直接返回 null 误报店铺不存在」的缺陷——miss 时查库自愈并以逻辑过期格式回填（回填加锁防并发）；`ShopServiceImpl.queryById` 由穿透方案切换为逻辑过期方案 |
