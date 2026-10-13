@@ -72,3 +72,4 @@ git diff master feature/refactor
 | 2026-10-05 | 修复秒杀订单消息 ACK 的 stream 名称错误（`s1` → `stream.orders`），避免 pending 消息堆积（`VoucherOrderServiceImpl`） |
 | 2026-10-09 | 秒杀增加开始/结束时间校验：起止时间写入 Redis，由 `seckill.lua` 判断；并修复库存 key 不存在时 `tonumber(nil)` 报错的容错（`VoucherServiceImpl` / `seckill.lua` / `VoucherOrderServiceImpl` / `RedisConstants`） |
 | 2026-10-10 | 秒杀异步下单由 Redis Stream 迁移到 RabbitMQ：publisher confirm + 消息持久化 + 失败重试 3 次进死信 + 并发消费（`concurrency`）+ `(user_id, voucher_id)` 唯一索引幂等兜底（新增 `RabbitMQConfig` / `MqConstants` / `SeckillOrderMsg`，改造 `VoucherOrderServiceImpl` / `seckill.lua` / `application.yaml` / `hmdp.sql`） |
+| 2026-10-13 | 缓存重建锁改用 Redisson `RLock`，修复原自研锁「释放不校验持有者、极端场景误删他人锁」的隐患（避免缓存击穿时多个线程同时打库）；逻辑过期方案将「拿锁 + 重建 + 释放锁」收敛到同一异步线程，规避 Redisson 锁跨线程释放报错（`CacheClient`） |
