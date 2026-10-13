@@ -62,6 +62,7 @@ git diff master feature/refactor
 - [x] 修复秒杀订单消息 ACK 的 stream 名称错误（`s1` → `stream.orders`）
 - [x] 秒杀开始/结束时间校验下沉到 Redis Lua（避免秒杀请求查数据库）
 - [x] 秒杀异步下单由 Redis Stream 迁移到 RabbitMQ（可靠投递 + 并发消费 + 死信队列 + 唯一索引幂等）
+- [x] 缓存重建锁改用 Redisson `RLock`（修复自研锁误删他人锁的隐患）
 
 ## 改造记录
 
