@@ -12,10 +12,15 @@ import org.springframework.stereotype.Component;
 import java.time.LocalDateTime;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 import static com.hmdp.utils.RedisConstants.CACHE_NULL_TTL;
+import static com.hmdp.utils.RedisConstants.CACHE_REBUILD_BUSY_MESSAGE;
+import static com.hmdp.utils.RedisConstants.CACHE_REBUILD_MAX_RETRIES;
+import static com.hmdp.utils.RedisConstants.CACHE_REBUILD_RETRY_MAX_MS;
+import static com.hmdp.utils.RedisConstants.CACHE_REBUILD_RETRY_MIN_MS;
 import static com.hmdp.utils.RedisConstants.LOCK_SHOP_KEY;
 
 @Slf4j
@@ -136,33 +141,53 @@ public class CacheClient {
 
         // 4.缓存未命中，用分布式锁保证同一时刻只有一个线程去查库重建
         RLock lock = redissonClient.getLock(LOCK_SHOP_KEY + id);
-        boolean isLock = lock.tryLock();
-        if (!isLock) {
-            // 4.1.抢锁失败：说明已有别的线程在重建缓存，本线程休眠后递归重试
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException(e);
+        // 有界重试：抢锁失败则等待 30~50ms 后重查缓存，最多重试 CACHE_REBUILD_MAX_RETRIES 次，仍失败则降级
+        for (int retry = 0; retry < CACHE_REBUILD_MAX_RETRIES; retry++) {
+            boolean isLock = lock.tryLock();
+            if (isLock) {
+                try {
+                    // 4.1.抢锁成功：先 double-check 缓存，等待期间别的线程可能已重建完成，避免重复查库
+                    shopJson = stringRedisTemplate.opsForValue().get(key);
+                    if (StrUtil.isNotBlank(shopJson)) {
+                        return JSONUtil.toBean(shopJson, type);
+                    }
+                    if (shopJson != null) {
+                        return null;
+                    }
+                    // 4.2.缓存仍不存在，查库重建缓存
+                    R r = dbFallback.apply(id);
+                    // 5.数据库不存在
+                    if (r == null) {
+                        // 将空值写入redis，避免缓存穿透
+                        stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+                        return null;
+                    }
+                    // 6.存在，写入redis
+                    this.set(key, r, time, unit);
+                    return r;
+                } finally {
+                    // 7.释放锁（Redisson 会校验持有线程，不会误删他人持有的锁）
+                    lock.unlock();
+                }
             }
-            return queryWithMutex(keyPrefix, id, type, dbFallback, time, unit);
-        }
-        // 4.2.抢锁成功，查库重建缓存
-        R r;
-        try {
-            r = dbFallback.apply(id);
-            // 5.数据库不存在
-            if (r == null) {
-                // 将空值写入redis，避免缓存穿透
-                stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+            // 4.3.抢锁失败：说明已有别的线程在重建缓存，等待 30~50ms 后重查缓存
+            try {
+                Thread.sleep(CACHE_REBUILD_RETRY_MIN_MS
+                        + ThreadLocalRandom.current().nextLong(CACHE_REBUILD_RETRY_MAX_MS - CACHE_REBUILD_RETRY_MIN_MS + 1));
+            } catch (InterruptedException e) {
+                // 恢复中断标记并立即降级，避免线程收到停止信号后继续空转
+                Thread.currentThread().interrupt();
+                throw new CacheBusyException(CACHE_REBUILD_BUSY_MESSAGE);
+            }
+            shopJson = stringRedisTemplate.opsForValue().get(key);
+            if (StrUtil.isNotBlank(shopJson)) {
+                return JSONUtil.toBean(shopJson, type);
+            }
+            if (shopJson != null) {
                 return null;
             }
-            // 6.存在，写入redis
-            this.set(key, r, time, unit);
-            return r;
-        } finally {
-            // 7.释放锁（Redisson 会校验持有线程，不会误删他人持有的锁）
-            lock.unlock();
         }
+        // 8.重试耗尽仍无法读到缓存：降级返回"系统繁忙"，不穿透到数据库
+        throw new CacheBusyException(CACHE_REBUILD_BUSY_MESSAGE);
     }
 }
