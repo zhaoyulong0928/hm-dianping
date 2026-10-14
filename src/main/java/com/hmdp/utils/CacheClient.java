@@ -130,6 +130,13 @@ public class CacheClient {
             try {
                 // 查询数据库并重建缓存
                 R newR = dbFallback.apply(id);
+                if (newR == null) {
+                    // 数据已删除/下架：删除缓存，避免写入 data=null 的脏缓存
+                    // （Jackson non_null 会丢掉 data 字段，下次读取时反序列化抛 ClassCastException）
+                    // 删掉 key 后，下次请求走 miss 自愈路径重新查库，返回"店铺不存在"，行为一致
+                    stringRedisTemplate.delete(key);
+                    return;
+                }
                 this.setWithLogicalExpire(key, newR, time, unit);
             } finally {
                 lock.unlock();
