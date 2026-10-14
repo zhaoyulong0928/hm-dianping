@@ -52,6 +52,7 @@ public class CacheClient {
         // 写入Redis
         stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData));
     }
+    
     // 解决缓存穿透问题，使用缓存空值
     public <R,ID> R queryWithPassThrough(
             String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit){
@@ -82,6 +83,7 @@ public class CacheClient {
         this.set(key, r, time, unit);
         return r;
     }
+    
     // 解决缓存击穿问题，使用逻辑过期时间
     public <R, ID> R queryWithLogicalExpire(
             String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {
@@ -136,6 +138,7 @@ public class CacheClient {
         // 5.缓存重建期间，先把过期的旧数据返回给用户
         return r;
     }
+    
     // 解决缓存击穿问题，使用互斥锁
     public <R, ID> R queryWithMutex(
             String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {

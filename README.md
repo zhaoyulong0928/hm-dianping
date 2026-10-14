@@ -19,7 +19,7 @@
 ## 功能模块
 
 - **登录认证**：验证码 + Redis Token + 双拦截器，实现无状态会话
-- **商户查询缓存**：缓存穿透 / 击穿 / 雪崩的处理，Cache Aside 更新策略
+- **商户查询缓存**：缓存穿透（参数校验 + 布隆过滤器）/ 击穿 / 雪崩的处理，Cache Aside 更新策略
 - **优惠券秒杀**：Lua 脚本原子校验 + 分布式锁 + RabbitMQ 消息队列异步下单
 - **探店笔记 / 好友关注**：点赞、关注、Feed 流
 - **附近商铺**：基于 Redis GEO 的距离排序与分页
@@ -65,6 +65,8 @@ git diff master feature/refactor
 - [x] 缓存重建锁改用 Redisson `RLock`（修复自研锁误删他人锁的隐患）
 - [x] 互斥锁方案改为「有界重试 + 降级」（消除无限递归重试，避免请求线程被长时间占用）
 - [x] 商户缓存读路径切换为逻辑过期方案：启动预热全量商铺 + 缓存 miss 查库自愈回填
+- [x] 商户查询增加缓存穿透主动防线：参数校验 + 布隆过滤器（Redisson RBloomFilter，启动全量加载）
+- [x] 延迟双删第二删升级为 RabbitMQ 延迟队列（TTL + 死信）可靠执行：消息持久化、宕机不丢、失败重试后进死信队列告警/人工补偿
 
 ## 改造记录
 
@@ -78,3 +80,5 @@ git diff master feature/refactor
 | 2026-10-13 | 缓存重建锁改用 Redisson `RLock`，修复原自研锁「释放不校验持有者、极端场景误删他人锁」的隐患（避免缓存击穿时多个线程同时打库）；逻辑过期方案将「拿锁 + 重建 + 释放锁」收敛到同一异步线程，规避 Redisson 锁跨线程释放报错（`CacheClient`） |
 | 2026-10-13 | 互斥锁方案消除无限递归重试：改为「抢锁失败等待 30~50ms 重查缓存，最多重试 3 次，仍失败抛 `CacheBusyException` 降级」；抢锁成功后先 double-check 缓存避免重复查库；中断时恢复标记并快速降级（`CacheClient` / `RedisConstants`，新增 `CacheBusyException` 及全局降级响应） |
 | 2026-10-13 | 商户缓存读路径切换为逻辑过期方案：新增 `ShopCachePreloader` 启动预热（`ApplicationRunner` 全量商铺写入逻辑过期缓存）；修复「延迟双删物理删除 key 后，逻辑过期 miss 直接返回 null 误报店铺不存在」的缺陷——miss 时查库自愈并以逻辑过期格式回填（回填加锁防并发）；`ShopServiceImpl.queryById` 由穿透方案切换为逻辑过期方案 |
+| 2026-10-13 | 商户查询增加缓存穿透主动防线：`queryById` 前置「参数校验 + 布隆过滤器」两道拦截，"从未存在过"的 id 不再查缓存/查库/写空值 key；布隆基于 Redisson `RBloomFilter`（预期 10 万元素 / 1% 误判率，位图约 115KB），启动时全量加载店铺 id，`add` 幂等可自愈；布隆误判与已删除店铺由读路径查库兜底（新增 `ShopBloomFilter`，改造 `ShopServiceImpl` / `RedisConstants`） |
+| 2026-10-14 | 延迟双删第二删升级为 RabbitMQ 延迟队列可靠执行：移除本地 `ScheduledThreadPoolExecutor` 定时删除（一次性执行、宕机即丢），改为事务提交后发送 `CacheDeleteMsg` 到延迟队列（`x-message-ttl=500ms` + 死信投递），由 `CacheDeleteListener` 消费执行二次删除；消息持久化在 RabbitMQ，进程宕机不丢；删除失败走全局重试拦截器（3 次）后进入 `cache.dlx.queue` 供告警/人工补偿；删除 key 幂等，可安全重试（新增 `CacheDeleteMsg` / `CacheDeleteListener`，改造 `ShopServiceImpl` / `RabbitMQConfig` / `MqConstants`） |

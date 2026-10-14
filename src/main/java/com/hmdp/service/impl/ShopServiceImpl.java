@@ -3,12 +3,17 @@ package com.hmdp.service.impl;
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.dto.CacheDeleteMsg;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.hmdp.utils.CacheClient;
+import com.hmdp.utils.MqConstants;
+import com.hmdp.utils.ShopBloomFilter;
 import com.hmdp.utils.SystemConstants;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
 import org.springframework.data.geo.GeoResults;
@@ -20,10 +25,8 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
-import javax.annotation.PreDestroy;
 import javax.annotation.Resource;
 import java.util.*;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 import static com.hmdp.utils.RedisConstants.*;
@@ -36,6 +39,7 @@ import static com.hmdp.utils.RedisConstants.*;
  * @author 虎哥
  * @since 2021-12-22
  */
+@Slf4j
 @Service
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
 
@@ -46,34 +50,28 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Resource
     private CacheClient cacheClient;
 
-    /** 延迟删除专用线程池：执行"第二次删除"，避免阻塞业务线程 */
-    private static final ScheduledThreadPoolExecutor DELAY_DELETE_EXECUTOR =
-            createDelayDeleteExecutor();
+    @Resource
+    private ShopBloomFilter shopBloomFilter;
 
-    /** 延迟双删的间隔：需大于"读线程查库 + 回写缓存"的耗时 */
-    private static final long DELAY_DELETE_MILLIS = 500L;
-
-    /** 创建延迟删除线程池：核心线程空闲 60s 后被回收，避免长期占用 */
-    private static ScheduledThreadPoolExecutor createDelayDeleteExecutor() {
-        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(2);
-        // 核心线程空闲存活时间
-        executor.setKeepAliveTime(60L, TimeUnit.SECONDS);
-        // 允许核心线程超时回收（默认 false，核心线程永不回收）
-        executor.allowCoreThreadTimeOut(true);
-        return executor;
-    }
+    @Resource
+    private RabbitTemplate rabbitTemplate;
 
     @Override
     public Result queryById(Long id) {
-        // 解决缓存穿透， （被动）缓存空对象，布隆过滤。（主动）增强id的复杂度，避免被猜测id规律，做好数据的基础格式校验，加强用户权限校验，做好热点参数限流
+        // 缓存穿透防线一：参数基础校验（主动防御），拦截明显非法的 id
+        if (id == null || id <= 0) {
+            return Result.fail("店铺不存在！");
+        }
+        // 缓存穿透防线二：布隆过滤器（ShopBloomFilter），拦截"从未存在过"的 id，不查缓存、不查库
+        if (!shopBloomFilter.contains(id)) {
+            return Result.fail("店铺不存在！");
+        }
+        // 缓存穿透防线三 + 缓存击穿处理：逻辑过期方案（ShopCachePreloader 启动预热，miss 查库自愈回填）
+        // 备选读方案（穿透-空值缓存 / 击穿-互斥锁）：
         // Shop shop = cacheClient
         //         .queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
-
-        // 互斥锁解决缓存击穿
         // Shop shop = cacheClient
         //         .queryWithMutex(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
-
-        // 逻辑过期解决缓存击穿（依赖 ShopCachePreloader 启动预热，未预热的 key 会返回 null）
         Shop shop = cacheClient
                 .queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, 20L, TimeUnit.SECONDS);
 
@@ -98,29 +96,23 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             @Override
             public void afterCommit() {
                 String key = CACHE_SHOP_KEY + id;
-                // 第一次删除：清掉缓存中的旧值
+                // 第一次删除：清掉缓存中的旧值（快速路径，大部分脏缓存即刻被清掉）
                 stringRedisTemplate.delete(key);
-                // 第二次删除（延迟）：兜住"提交前读到旧值、删除后才回写"的脏数据
-                DELAY_DELETE_EXECUTOR.schedule(
-                        () -> stringRedisTemplate.delete(key),
-                        DELAY_DELETE_MILLIS, TimeUnit.MILLISECONDS);
+                // 第二次删除（延迟 500ms）：兜住"提交前读到旧值、删除后才回写"的脏数据，
+                // 改用 RabbitMQ 延迟队列（TTL + 死信）执行，消息持久化，进程宕机不丢；
+                // 删除失败走全局重试拦截器，重试耗尽进入 cache.dlx.queue 供告警 / 人工补偿。
+                try {
+                    rabbitTemplate.convertAndSend(
+                            MqConstants.CACHE_DELETE_EXCHANGE,
+                            MqConstants.CACHE_DELETE_DELAY_ROUTING_KEY,
+                            new CacheDeleteMsg(key));
+                } catch (Exception e) {
+                    // 发送失败仅影响第二次兜底删除，第一次删除已生效，此处记错误日志，不阻断主流程
+                    log.error("缓存延迟删除消息发送失败: key={}", key, e);
+                }
             }
         });
         return Result.ok();
-    }
-
-    /** 应用关闭时优雅停止线程池：等待未执行的延迟删除任务执行完 */
-    @PreDestroy
-    public void shutdownDelayDeleteExecutor() {
-        DELAY_DELETE_EXECUTOR.shutdown();
-        try {
-            if (!DELAY_DELETE_EXECUTOR.awaitTermination(5, TimeUnit.SECONDS)) {
-                DELAY_DELETE_EXECUTOR.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            DELAY_DELETE_EXECUTOR.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
     }
 
     @Override

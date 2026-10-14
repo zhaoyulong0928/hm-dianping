@@ -11,6 +11,9 @@ public class RedisConstants {
     public static final Long CACHE_SHOP_TTL = 30L;
     public static final String CACHE_SHOP_KEY = "cache:shop:";
 
+    /** 商户布隆过滤器 key：拦截"从未存在过"的店铺 id，防缓存穿透（Redisson RBloomFilter 位图） */
+    public static final String BLOOM_SHOP_KEY = "bloom:shop";
+
     public static final String LOCK_SHOP_KEY = "lock:shop:";
     public static final Long LOCK_SHOP_TTL = 10L;
 

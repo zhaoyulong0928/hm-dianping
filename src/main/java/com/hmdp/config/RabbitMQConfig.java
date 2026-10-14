@@ -70,6 +70,70 @@ public class RabbitMQConfig {
                 .with(MqConstants.SECKILL_DLX_ROUTING_KEY);
     }
 
+    // ============ 缓存删除：延迟队列(TTL) + 实际删除队列 + 死信队列 ============
+
+    @Bean
+    public DirectExchange cacheDeleteExchange() {
+        return new DirectExchange(MqConstants.CACHE_DELETE_EXCHANGE, true, false);
+    }
+
+    /**
+     * 延迟队列：消息在此停留 CACHE_DELETE_DELAY_MILLIS(500ms) 后过期，
+     * 经死信投递到 cacheDeleteExchange，凭 CACHE_DELETE_ROUTING_KEY 转发给实际删除队列。
+     * 相比原"本地线程池延迟删除"：消息持久化在 RabbitMQ，宕机不丢、失败可重试可追踪。
+     */
+    @Bean
+    public Queue cacheDeleteDelayQueue() {
+        Map<String, Object> args = new HashMap<>();
+        args.put("x-message-ttl", MqConstants.CACHE_DELETE_DELAY_MILLIS);
+        args.put("x-dead-letter-exchange", MqConstants.CACHE_DELETE_EXCHANGE);
+        args.put("x-dead-letter-routing-key", MqConstants.CACHE_DELETE_ROUTING_KEY);
+        return new Queue(MqConstants.CACHE_DELETE_DELAY_QUEUE, true, false, false, args);
+    }
+
+    @Bean
+    public Binding cacheDeleteDelayBinding() {
+        return BindingBuilder.bind(cacheDeleteDelayQueue())
+                .to(cacheDeleteExchange())
+                .with(MqConstants.CACHE_DELETE_DELAY_ROUTING_KEY);
+    }
+
+    /**
+     * 实际删除队列：消费者消费后执行 Redis 删除。
+     * 删除是幂等操作，可安全重试；消费失败（抛异常）重试耗尽后进入缓存删除死信队列，供告警 / 人工补偿。
+     */
+    @Bean
+    public Queue cacheDeleteQueue() {
+        Map<String, Object> args = new HashMap<>();
+        args.put("x-dead-letter-exchange", MqConstants.CACHE_DLX_EXCHANGE);
+        args.put("x-dead-letter-routing-key", MqConstants.CACHE_DLX_ROUTING_KEY);
+        return new Queue(MqConstants.CACHE_DELETE_QUEUE, true, false, false, args);
+    }
+
+    @Bean
+    public Binding cacheDeleteBinding() {
+        return BindingBuilder.bind(cacheDeleteQueue())
+                .to(cacheDeleteExchange())
+                .with(MqConstants.CACHE_DELETE_ROUTING_KEY);
+    }
+
+    @Bean
+    public DirectExchange cacheDlxExchange() {
+        return new DirectExchange(MqConstants.CACHE_DLX_EXCHANGE, true, false);
+    }
+
+    @Bean
+    public Queue cacheDlxQueue() {
+        return new Queue(MqConstants.CACHE_DLX_QUEUE, true);
+    }
+
+    @Bean
+    public Binding cacheDlxBinding() {
+        return BindingBuilder.bind(cacheDlxQueue())
+                .to(cacheDlxExchange())
+                .with(MqConstants.CACHE_DLX_ROUTING_KEY);
+    }
+
     // ============ 消息转换器：JSON ============
 
     @Bean
