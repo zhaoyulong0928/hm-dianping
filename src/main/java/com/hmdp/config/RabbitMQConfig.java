@@ -84,18 +84,24 @@ public class RabbitMQConfig {
      */
     @Bean
     public Queue cacheDeleteDelayQueue() {
+        // 持久化队列，并绑定死信交换机（消费失败重试耗尽后进入）
         Map<String, Object> args = new HashMap<>();
+        // 消息过期时间（500ms）
         args.put("x-message-ttl", MqConstants.CACHE_DELETE_DELAY_MILLIS);
+        // 死信交换机（cacheDeleteExchange）
         args.put("x-dead-letter-exchange", MqConstants.CACHE_DELETE_EXCHANGE);
+        // 死信路由键（CACHE_DELETE_ROUTING_KEY）
         args.put("x-dead-letter-routing-key", MqConstants.CACHE_DELETE_ROUTING_KEY);
+        // 消息持久化在 RabbitMQ
         return new Queue(MqConstants.CACHE_DELETE_DELAY_QUEUE, true, false, false, args);
     }
 
     @Bean
     public Binding cacheDeleteDelayBinding() {
-        return BindingBuilder.bind(cacheDeleteDelayQueue())
-                .to(cacheDeleteExchange())
+        return BindingBuilder.bind(cacheDeleteDelayQueue())// 这是延迟队列的绑定
+                .to(cacheDeleteExchange())// 这个的作用是将延迟队列绑定到缓存删除交换机上
                 .with(MqConstants.CACHE_DELETE_DELAY_ROUTING_KEY);
+
     }
 
     /**
@@ -105,8 +111,8 @@ public class RabbitMQConfig {
     @Bean
     public Queue cacheDeleteQueue() {
         Map<String, Object> args = new HashMap<>();
-        args.put("x-dead-letter-exchange", MqConstants.CACHE_DLX_EXCHANGE);
-        args.put("x-dead-letter-routing-key", MqConstants.CACHE_DLX_ROUTING_KEY);
+        args.put("x-dead-letter-exchange", MqConstants.CACHE_DLX_EXCHANGE); // 死信交换机
+        args.put("x-dead-letter-routing-key", MqConstants.CACHE_DLX_ROUTING_KEY);// 死信路由键
         return new Queue(MqConstants.CACHE_DELETE_QUEUE, true, false, false, args);
     }
 
@@ -117,6 +123,9 @@ public class RabbitMQConfig {
                 .with(MqConstants.CACHE_DELETE_ROUTING_KEY);
     }
 
+    /**
+     * 死信交换机：死信队列、JSON 转换器、重试与并发消费，为死信兜底提供保障
+     */
     @Bean
     public DirectExchange cacheDlxExchange() {
         return new DirectExchange(MqConstants.CACHE_DLX_EXCHANGE, true, false);
@@ -143,22 +152,36 @@ public class RabbitMQConfig {
 
     // ============ RabbitTemplate：JSON + 发送方确认 + 失败回退 ============
 
+    /*
+     * 场景                         ConfirmCallback          ReturnCallback     你的处理
+     * 成功路由到队列                  ack=true                   不触发              正常完成
+     * 交换机不存在 / Broker 未确认    通常 ack=false               通常不触发          记录“消息未确认”
+     * 交换机存在但无匹配队列           通常 ack=true               触发           记录“消息路由失败”
+     * 消费者处理失败                 与此无关                     与此无关            需消费端重试、ACK、DLX 处理
+     */
     @Bean
     public RabbitTemplate rabbitTemplate(ConnectionFactory connectionFactory, MessageConverter messageConverter) {
         RabbitTemplate template = new RabbitTemplate(connectionFactory);
         template.setMessageConverter(messageConverter);
-        // 开启 mandatory：消息无法路由到队列时触发 ReturnsCallback，避免静默丢失
+        // 开启 mandatory： mandatory=true 表示：若消息已经到达交换机，但交换机根据 routing key
+        // 找不到任何匹配队列，RabbitMQ 不要静默丢弃，而是把消息退回给生产者。
         template.setMandatory(true);
         // 发送方确认（publisher confirm）：broker 未确认时记录日志
+        /*
+         * • ack = true ：Broker 已确认收到并处理了发布请求
+         * • ack = false ：Broker 未确认，可能是交换机不存在、连接异常等；你这里会记录错误日志
+         * • correlationData ：消息的关联标识，用于定位到底是哪一条消息发送失败
+         * • cause ：失败原因（若有）
+         */
         template.setConfirmCallback((correlationData, ack, cause) -> {
             if (!ack) {
                 log.error("消息未确认: correlationData={}, cause={}", correlationData, cause);
             }
         });
         // 消息无法路由到队列时触发（spring-amqp 2.2 使用 ReturnCallback）
-        template.setReturnCallback((message, replyCode, replyText, exchange, routingKey) ->
-                log.error("消息路由失败: message={}, replyCode={}, replyText={}, exchange={}, routingKey={}",
-                        message, replyCode, replyText, exchange, routingKey));
+        template.setReturnCallback((message, replyCode, replyText, exchange, routingKey) -> log.error(
+                "消息路由失败: message={}, replyCode={}, replyText={}, exchange={}, routingKey={}",
+                message, replyCode, replyText, exchange, routingKey));
         return template;
     }
 
@@ -167,27 +190,29 @@ public class RabbitMQConfig {
     @Bean
     public RetryOperationsInterceptor seckillRetryInterceptor() {
         return RetryInterceptorBuilder.stateless()
-                .maxAttempts(3)
-                .backOffOptions(1000L, 2.0, 3000L)
-                .recoverer(new RejectAndDontRequeueRecoverer())
-                .build();
+                .maxAttempts(3)// 最大重试次数
+                .backOffOptions(1000L, 2.0, 3000L) // 重试间隔（毫秒）
+                .recoverer(new RejectAndDontRequeueRecoverer()) // 拒绝不重回队列
+                .build(); // 构建重试拦截器
     }
 
     // ============ 监听容器工厂：并发消费 + 自动确认 + 重试拦截器 ============
 
     @Bean("rabbitListenerContainerFactory")
     public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
-            ConnectionFactory connectionFactory, MessageConverter messageConverter, RetryOperationsInterceptor seckillRetryInterceptor) {
+            ConnectionFactory connectionFactory, MessageConverter messageConverter,
+            RetryOperationsInterceptor seckillRetryInterceptor) {
         SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
-        factory.setConnectionFactory(connectionFactory);
+        factory.setConnectionFactory(connectionFactory); // · 连接工厂
         // 与生产者保持一致，使用 JSON 反序列化
-        factory.setMessageConverter(messageConverter);
+        factory.setMessageConverter(messageConverter); // · 消息转换器
+        // 自动确认：消息处理完成后自动确认，避免消息丢失
         factory.setAcknowledgeMode(AcknowledgeMode.AUTO);
         // 每个消费者一次预取几条，控制数据库压力
-        factory.setPrefetchCount(10);
-        factory.setConcurrentConsumers(4);
-        factory.setMaxConcurrentConsumers(8);
-        factory.setAdviceChain(seckillRetryInterceptor);
+        factory.setPrefetchCount(10); // · 每个消费者一次预取几条
+        factory.setConcurrentConsumers(4); // · 并发消费者数
+        factory.setMaxConcurrentConsumers(8); // · 最大并发消费者数
+        factory.setAdviceChain(seckillRetryInterceptor); // · 重试拦截器
         return factory;
     }
 }
