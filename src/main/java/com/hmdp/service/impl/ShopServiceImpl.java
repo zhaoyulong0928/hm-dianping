@@ -13,6 +13,7 @@ import com.hmdp.utils.MqConstants;
 import com.hmdp.utils.ShopBloomFilter;
 import com.hmdp.utils.SystemConstants;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
@@ -25,8 +26,10 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import javax.annotation.PreDestroy;
 import javax.annotation.Resource;
 import java.util.*;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 import static com.hmdp.utils.RedisConstants.*;
@@ -55,6 +58,24 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     @Resource
     private RabbitTemplate rabbitTemplate;
+
+    /**
+     * 本地兜底延迟删除线程池：与 MQ 路径组成"双保险"，仅在进程存活时兜住"消息到达 broker 之前失败"的盲区
+     * （同步发送异常 / broker nack / 路由失败）。删除 key 幂等，与 MQ 路径重复执行无副作用。
+     * 核心线程空闲 60s 后回收、允许核心线程超时，避免长期占用；应用关闭时优雅停止。
+     */
+    private static final ScheduledThreadPoolExecutor CACHE_DELETE_FALLBACK_EXECUTOR =
+            createCacheDeleteFallbackExecutor();
+
+    /** 创建本地兜底延迟删除线程池：核心线程空闲 60s 后被回收，避免长期占用 */
+    private static ScheduledThreadPoolExecutor createCacheDeleteFallbackExecutor() {
+        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1);
+        // 核心线程空闲存活时间
+        executor.setKeepAliveTime(60L, TimeUnit.SECONDS);
+        // 允许核心线程超时回收（默认 false，核心线程永不回收）
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
+    }
 
     @Override
     public Result queryById(Long id) {
@@ -98,21 +119,48 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
                 String key = CACHE_SHOP_KEY + id;
                 // 第一次删除：清掉缓存中的旧值（快速路径，大部分脏缓存即刻被清掉）
                 stringRedisTemplate.delete(key);
-                // 第二次删除（延迟 500ms）：兜住"提交前读到旧值、删除后才回写"的脏数据，
-                // 改用 RabbitMQ 延迟队列（TTL + 死信）执行，消息持久化，进程宕机不丢；
-                // 删除失败走全局重试拦截器，重试耗尽进入 cache.dlx.queue 供告警 / 人工补偿。
+                // 第二次删除（延迟约 500ms）：兜住"提交前读到旧值、删除后才回写"的脏数据。
+                // 采用"双保险"两条路径（两者都无条件执行，并非主备/条件触发关系），互为盲区补位：
+                // 两条路径不会冲突——删除 key 幂等（key 不存在时 DEL 返回 0、不报错），且 Redis 命令串行执行，
+                // 因此谁先谁后、甚至同时到达，最终结果都是"key 被删掉"，最坏只是多一次无副作用的 DEL。
+
+                // 路径一：本地延迟删除。覆盖"消息到达 broker 之前失败"的盲区
+                // （同步发送异常 / broker nack / 路由失败）——此刻进程仍存活，本地任务必定执行。
+                CACHE_DELETE_FALLBACK_EXECUTOR.schedule(
+                        () -> stringRedisTemplate.delete(key),
+                        MqConstants.CACHE_DELETE_DELAY_MILLIS, TimeUnit.MILLISECONDS);
+
+                // 路径二：RabbitMQ 延迟队列（TTL + 死信）。覆盖"本地任务执行前进程宕机"的盲区
+                // ——消息已持久化在 broker，重启后仍会消费执行；消费失败重试耗尽进入 cache.dlx.queue。
+                // 实际触发时刻：本地为精确的 T+500ms，MQ 因 broker 投递与消费耗时略晚，两者并非同一瞬间执行。
                 try {
                     rabbitTemplate.convertAndSend(
-                            MqConstants.CACHE_DELETE_EXCHANGE,
-                            MqConstants.CACHE_DELETE_DELAY_ROUTING_KEY,
-                            new CacheDeleteMsg(key));
+                            MqConstants.CACHE_DELETE_EXCHANGE, //交换机名
+                            MqConstants.CACHE_DELETE_DELAY_ROUTING_KEY, //路由键
+                            new CacheDeleteMsg(key), //消息
+                            new CorrelationData(key)); //消息标识，供 confirm 回调定位失败消息
                 } catch (Exception e) {
-                    // 发送失败仅影响第二次兜底删除，第一次删除已生效，此处记错误日志，不阻断主流程
-                    log.error("缓存延迟删除消息发送失败: key={}", key, e);
+                    // 路径一已无条件执行过，此处发送失败不影响最终删除结果，仅记日志、不阻断主流程
+                    log.error("缓存延迟删除消息发送失败，路径一本地兜底已覆盖: key={}", key, e);
                 }
+                // 唯一的失效窗口（无法用当前方案消除）：本地任务执行前进程崩溃 且 MQ 发送失败（两者皆失）。
             }
         });
         return Result.ok();
+    }
+
+    /** 应用关闭时优雅停止本地兜底删除线程池：等待未执行的延迟删除任务执行完 */
+    @PreDestroy
+    public void shutdownCacheDeleteFallbackExecutor() {
+        CACHE_DELETE_FALLBACK_EXECUTOR.shutdown();
+        try {
+            if (!CACHE_DELETE_FALLBACK_EXECUTOR.awaitTermination(5, TimeUnit.SECONDS)) {
+                CACHE_DELETE_FALLBACK_EXECUTOR.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            CACHE_DELETE_FALLBACK_EXECUTOR.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Override

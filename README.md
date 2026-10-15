@@ -67,6 +67,7 @@ git diff master feature/refactor
 - [x] 商户缓存读路径切换为逻辑过期方案：启动预热全量商铺 + 缓存 miss 查库自愈回填
 - [x] 商户查询增加缓存穿透主动防线：参数校验 + 布隆过滤器（Redisson RBloomFilter，启动全量加载）
 - [x] 延迟双删第二删升级为 RabbitMQ 延迟队列（TTL + 死信）可靠执行：消息持久化、宕机不丢、失败重试后进死信队列告警/人工补偿
+- [x] 缓存延迟双删第二次删除改为「MQ 可靠路径 + 本地兜底」双保险：发送侧补 `CorrelationData`，并用本地延迟删除兜住「消息到达 broker 之前失败（同步异常/nack/路由失败）」的盲区
 
 ## 改造记录
 
@@ -83,3 +84,4 @@ git diff master feature/refactor
 | 2026-10-13 | 商户查询增加缓存穿透主动防线：`queryById` 前置「参数校验 + 布隆过滤器」两道拦截，"从未存在过"的 id 不再查缓存/查库/写空值 key；布隆基于 Redisson `RBloomFilter`（预期 10 万元素 / 1% 误判率，位图约 115KB），启动时全量加载店铺 id，`add` 幂等可自愈；布隆误判与已删除店铺由读路径查库兜底（新增 `ShopBloomFilter`，改造 `ShopServiceImpl` / `RedisConstants`） |
 | 2026-10-14 | 延迟双删第二删升级为 RabbitMQ 延迟队列可靠执行：移除本地 `ScheduledThreadPoolExecutor` 定时删除（一次性执行、宕机即丢），改为事务提交后发送 `CacheDeleteMsg` 到延迟队列（`x-message-ttl=500ms` + 死信投递），由 `CacheDeleteListener` 消费执行二次删除；消息持久化在 RabbitMQ，进程宕机不丢；删除失败走全局重试拦截器（3 次）后进入 `cache.dlx.queue` 供告警/人工补偿；删除 key 幂等，可安全重试（新增 `CacheDeleteMsg` / `CacheDeleteListener`，改造 `ShopServiceImpl` / `RabbitMQConfig` / `MqConstants`） |
 | 2026-10-14 | 修复逻辑过期方案「数据删除」边界缺陷：异步重建时若数据库已无数据（`dbFallback` 返回 null），直接删除缓存 key 而非写入 `data=null` 的 `RedisData`——Jackson `non_null` 会丢弃 `data` 字段，下次读取时 `(JSONObject) null` 反序列化抛 `ClassCastException`，且新 `expireTime` 在未来导致异常被固化在缓存中；删除 key 后由 miss 自愈路径重新查库返回「店铺不存在」，行为一致（`CacheClient`） |
+| 2026-10-15 | 缓存延迟双删第二次删除改为「MQ 可靠路径 + 本地兜底」双保险：在原有 MQ 延迟队列的基础上，恢复本地 `ScheduledThreadPoolExecutor` 兜底删除（闲时回收 + `@PreDestroy` 优雅关闭），两条路径互为盲区补位——本地兜住「消息到达 broker 之前失败（同步异常 / broker nack / 路由失败）」，MQ 兜住「本地任务执行前进程宕机」；删除 key 幂等，重复执行无副作用。同时发送侧补 `CorrelationData(key)`，便于 confirm 回调定位失败消息（`ShopServiceImpl`） |
