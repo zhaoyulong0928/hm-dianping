@@ -154,10 +154,10 @@ public class RabbitMQConfig {
 
     /*
      * 场景                         ConfirmCallback          ReturnCallback     你的处理
-     * 成功路由到队列                  ack=true                   不触发              正常完成
-     * 交换机不存在 / Broker 未确认    通常 ack=false               通常不触发          记录“消息未确认”
+     * 成功路由到队列                  ack=true                   不触发           正常完成
+     * 交换机不存在 / Broker 未确认    通常 ack=false               通常不触发      记录“消息未确认”
      * 交换机存在但无匹配队列           通常 ack=true               触发           记录“消息路由失败”
-     * 消费者处理失败                 与此无关                     与此无关            需消费端重试、ACK、DLX 处理
+     * 消费者处理失败                 与此无关                     与此无关        需消费端重试、ACK、DLX 处理
      */
     @Bean
     public RabbitTemplate rabbitTemplate(ConnectionFactory connectionFactory, MessageConverter messageConverter) {
@@ -166,13 +166,14 @@ public class RabbitMQConfig {
         // 开启 mandatory： mandatory=true 表示：若消息已经到达交换机，但交换机根据 routing key
         // 找不到任何匹配队列，RabbitMQ 不要静默丢弃，而是把消息退回给生产者。
         template.setMandatory(true);
-        // 发送方确认（publisher confirm）：broker 未确认时记录日志
-        /*
+
+        /*   发送方确认（publisher confirm）：broker 未确认时记录日志
          * • ack = true ：Broker 已确认收到并处理了发布请求
          * • ack = false ：Broker 未确认，可能是交换机不存在、连接异常等；你这里会记录错误日志
          * • correlationData ：消息的关联标识，用于定位到底是哪一条消息发送失败
          * • cause ：失败原因（若有）
          */
+        // 发送方确认（publisher confirm）：broker 未确认时记录日志
         template.setConfirmCallback((correlationData, ack, cause) -> {
             if (!ack) {
                 log.error("消息未确认: correlationData={}, cause={}", correlationData, cause);
@@ -189,14 +190,15 @@ public class RabbitMQConfig {
 
     @Bean
     public RetryOperationsInterceptor seckillRetryInterceptor() {
-        return RetryInterceptorBuilder.stateless()
+        return RetryInterceptorBuilder
+                .stateless()
                 .maxAttempts(3)// 最大重试次数
                 .backOffOptions(1000L, 2.0, 3000L) // 重试间隔（毫秒）
                 .recoverer(new RejectAndDontRequeueRecoverer()) // 拒绝不重回队列
                 .build(); // 构建重试拦截器
     }
 
-    // ============ 监听容器工厂：并发消费 + 自动确认 + 重试拦截器 ============
+    // ============ 监听容器工厂：并发消费 + 自动确认 + 重试拦截器 ，这个工厂对所有不指定`containerFactory` 的监听器生效。============
 
     @Bean("rabbitListenerContainerFactory")
     public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
@@ -212,7 +214,7 @@ public class RabbitMQConfig {
         factory.setPrefetchCount(10); // · 每个消费者一次预取几条
         factory.setConcurrentConsumers(4); // · 并发消费者数
         factory.setMaxConcurrentConsumers(8); // · 最大并发消费者数
-        factory.setAdviceChain(seckillRetryInterceptor); // · 重试拦截器
+        factory.setAdviceChain(seckillRetryInterceptor); // · 重试拦截器注册
         return factory;
     }
 }
