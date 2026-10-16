@@ -83,6 +83,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             if (r == 4) {
                 return Result.fail("秒杀已经结束");
             }
+            if (r == 5) {
+                // 用户级限流触发：每用户每秒最多 1 次（seckill.lua 固定窗口），拦截并行/高频的脚本请求
+                return Result.fail("操作过于频繁，请稍后再试");
+            }
             return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
         }
         // 5.发送下单消息到 RabbitMQ
