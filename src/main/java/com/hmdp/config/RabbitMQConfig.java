@@ -23,6 +23,9 @@ import java.util.Map;
 
 /**
  * RabbitMQ 配置：交换机、队列、死信队列、JSON 转换器、重试与并发消费
+ * broker 眼里“死信”只有三种触发方式：reject/nack(requeue=false)、TTL 过期、队列超长。
+ * 秒杀链路用第一种做 故障兜底 ；
+ * 而缓存链路的 cacheDeleteDelayQueue 用第二种（500ms TTL + DLX）做 延迟队列 。
  */
 @Slf4j
 @Configuration
@@ -153,11 +156,11 @@ public class RabbitMQConfig {
     // ============ RabbitTemplate：JSON + 发送方确认 + 失败回退 ============
 
     /*
-     * 场景                         ConfirmCallback          ReturnCallback     你的处理
-     * 成功路由到队列                  ack=true                   不触发           正常完成
-     * 交换机不存在 / Broker 未确认    通常 ack=false               通常不触发      记录“消息未确认”
-     * 交换机存在但无匹配队列           通常 ack=true               触发           记录“消息路由失败”
-     * 消费者处理失败                 与此无关                     与此无关        需消费端重试、ACK、DLX 处理
+     * 场景 ConfirmCallback ReturnCallback 你的处理
+     * 成功路由到队列 ack=true 不触发 正常完成
+     * 交换机不存在 / Broker 未确认 通常 ack=false 通常不触发 记录“消息未确认”
+     * 交换机存在但无匹配队列 通常 ack=true 触发 记录“消息路由失败”
+     * 消费者处理失败 与此无关 与此无关 需消费端重试、ACK、DLX 处理
      */
     @Bean
     public RabbitTemplate rabbitTemplate(ConnectionFactory connectionFactory, MessageConverter messageConverter) {
@@ -167,7 +170,8 @@ public class RabbitMQConfig {
         // 找不到任何匹配队列，RabbitMQ 不要静默丢弃，而是把消息退回给生产者。
         template.setMandatory(true);
 
-        /*   发送方确认（publisher confirm）：broker 未确认时记录日志
+        /*
+         * 发送方确认（publisher confirm）：broker 未确认时记录日志
          * • ack = true ：Broker 已确认收到并处理了发布请求
          * • ack = false ：Broker 未确认，可能是交换机不存在、连接异常等；你这里会记录错误日志
          * • correlationData ：消息的关联标识，用于定位到底是哪一条消息发送失败
@@ -187,7 +191,17 @@ public class RabbitMQConfig {
     }
 
     // ============ 重试拦截器：失败重试 N 次后拒绝不重回队列 → 进入死信队列 ============
-
+    /*
+     * 监听方法抛异常
+     * ↓
+     * 重试拦截器重试“消费业务方法”
+     * ↓
+     * 成功：ACK
+     * 持续失败：Recoverer
+     * ↓
+     * 不重回原队列，进入 DLQ / 补偿
+     * 
+     */
     @Bean
     public RetryOperationsInterceptor seckillRetryInterceptor() {
         return RetryInterceptorBuilder
@@ -198,7 +212,8 @@ public class RabbitMQConfig {
                 .build(); // 构建重试拦截器
     }
 
-    // ============ 监听容器工厂：并发消费 + 自动确认 + 重试拦截器 ，这个工厂对所有不指定`containerFactory` 的监听器生效。============
+    // ============ 监听容器工厂：并发消费 + 自动确认 + 重试拦截器 ，这个工厂对所有不指定`containerFactory`
+    // 的监听器生效。============
 
     @Bean("rabbitListenerContainerFactory")
     public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
