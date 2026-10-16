@@ -72,6 +72,7 @@ git diff master feature/refactor
 - [x] 秒杀用户级限流：Lua 前置固定窗口（每用户每秒 1 次），业务校验前拦截脚本并行请求
 - [x] 秒杀订单锁粒度细化到「用户 + 券」，杜绝同用户跨券并发丢单
 - [x] 秒杀订单落库顺序修正：订单插入前置于库存扣减，封死「扣库存无订单」脏提交窗口
+- [x] 秒杀消费端终态失败（库存不足）就地补偿：手动标记事务回滚 + 回滚 Redis 后正常 ack，死信队列退化为「仅承接基础设施故障、有消息即告警」的健康仪表盘
 
 ## 改造记录
 
@@ -93,3 +94,4 @@ git diff master feature/refactor
 | 2026-10-16 | 秒杀用户级限流：`seckill.lua` 最前置固定窗口限流（`INCR`+`EXPIRE`，每用户每秒最多放行 1 次，返回码 5），在时间/库存/一人一单校验之前拦截并行/高频的脚本请求，不产生任何业务写操作；`VoucherOrderServiceImpl` 增加返回码 5 的降级响应（`seckill.lua` / `VoucherOrderServiceImpl`；另含 lua 文件 EOL 归一化 CRLF→LF 及 Redis Cluster 适用性注释） |
 | 2026-10-16 | 秒杀订单 Redisson 锁粒度细化：`lock:order:{userId}` → `lock:order:{userId}:{voucherId}`，修复同一用户并发抢多张不同秒杀券时锁竞争失败、消息被静默跳过导致的丢单——锁只应互斥同一(用户, 券)的重复消息，不应误杀同一用户抢不同券的合法并发（`VoucherOrderServiceImpl`） |
 | 2026-10-16 | 秒杀订单落库顺序修正：订单插入前置于库存扣减——并发重复消息在扣库存之前即被唯一索引拦截，即使 `DuplicateKeyException` 被外层 catch 吞掉、事务照常提交，事务内也未发生任何写操作，封死「扣库存无订单」的脏提交窗口（解锁早于事务提交 + MVCC 快照读看不见未提交订单，重复消息可绕过查重直达 save）；库存不足时抛异常回滚含订单的整个事务，重试耗尽进死信队列（`VoucherOrderServiceImpl`） |
+| 2026-10-16 | 秒杀消费端区分「终态失败 vs 瞬时故障」：库存不足（Redis/DB 账本漂移所致，lua 前置校验后概率≈0，重试无意义）不再走「重试 3 次 → 死信」路径，改为 catch `IllegalStateException` 就地了结——`TransactionAspectSupport.setRollbackOnly()` 手动标记回滚（防 catch 吞异常后 save 的 INSERT 随事务提交成「有订单没扣库存」脏数据）+ `rollbackSeckill` 补偿回滚 Redis 库存与一人一单记录后正常 ack；补偿自身失败仍自然回落到重试/死信路径（Redis 故障期间自动降级为告警模式）；死信队列因此退化为「仅承接基础设施故障（DB/Redis 抖动超重试窗口、毒消息）、有消息即告警」的健康仪表盘，历史测试死信已清除归零（`VoucherOrderServiceImpl`） |

@@ -24,6 +24,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.interceptor.TransactionAspectSupport;
 
 import javax.annotation.Resource;
 import java.util.Collections;
@@ -124,6 +125,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             // 唯一索引兜底：重复消息直接忽略（幂等），正常确认不重试。
             // save 已前置于扣库存，此时事务内未发生任何写操作，提交无副作用
             log.warn("重复下单消息，忽略: {}", msg);
+        } catch (IllegalStateException e) {
+            // 库存不足：终态失败（Redis/DB 账本漂移所致），重试无意义，就地补偿，
+            // 死信队列因此只承接基础设施故障，退化为"有消息即告警"的健康仪表盘。
+            // 关键：catch 住不抛后事务默认提交，而 save() 的 INSERT 还在事务里，
+            // 必须手动标记回滚，否则提交出"有订单没扣库存"的脏数据
+            TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+            log.error("库存不足终态失败，补偿回滚 Redis: voucherId={}, userId={}",
+                    msg.getVoucherId(), msg.getUserId());
+            rollbackSeckill(msg.getVoucherId(), msg.getUserId());
         }
     }
 
