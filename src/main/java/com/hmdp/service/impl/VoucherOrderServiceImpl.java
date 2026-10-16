@@ -121,7 +121,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         try {
             createVoucherOrder(voucherOrder);
         } catch (DuplicateKeyException e) {
-            // 唯一索引兜底：重复消息直接忽略（幂等），正常确认不重试
+            // 唯一索引兜底：重复消息直接忽略（幂等），正常确认不重试。
+            // save 已前置于扣库存，此时事务内未发生任何写操作，提交无副作用
             log.warn("重复下单消息，忽略: {}", msg);
         }
     }
@@ -151,18 +152,19 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 return;
             }
 
-            // 2.扣减库存
+            // 2.创建订单（前置于扣库存：并发重复消息在扣库存之前就会被唯一索引拦截，
+            // 即使异常被外层 catch 吞掉后事务照常提交，事务内也未发生任何写操作，不会出现"扣库存无订单"的脏提交）
+            save(voucherOrder);
+
+            // 3.扣减库存
             boolean success = seckillVoucherService.update()
                     .setSql("stock = stock - 1") // set stock = stock - 1
                     .eq("voucher_id", voucherId).gt("stock", 0) // where id = ? and stock > 0
                     .update();
             if (!success) {
-                // 扣减失败
+                // 扣减失败：抛出异常回滚整个事务（含已插入的订单），重试耗尽后进死信队列
                 throw new IllegalStateException("库存不足");
             }
-
-            // 3.创建订单
-            save(voucherOrder);
         } finally {
             // 释放锁
             redisLock.unlock();
