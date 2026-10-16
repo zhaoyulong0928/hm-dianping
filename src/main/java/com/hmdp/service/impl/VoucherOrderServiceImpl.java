@@ -129,14 +129,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private void createVoucherOrder(VoucherOrder voucherOrder) {
         Long userId = voucherOrder.getUserId();
         Long voucherId = voucherOrder.getVoucherId();
-        // 创建锁对象
-        RLock redisLock = redissonClient.getLock("lock:order:" + userId);
+        // 创建锁对象（锁粒度 = 用户 + 券：只有同一(用户,券)的重复消息才互斥；
+        // 同一用户抢不同券的合法并发互不干扰，避免"抢锁失败即跳过"误杀正常订单）
+        RLock redisLock = redissonClient.getLock("lock:order:" + userId + ":" + voucherId);
         // 尝试获取锁
         boolean isLock = redisLock.tryLock();
         // 判断
         if (!isLock) {
-            // 并发下同一用户的多条重复消息，未获取到锁的直接跳过（另一条会落库）
-            log.warn("未获取到锁，跳过本次下单: userId={}", userId);
+            // 并发下同一(用户,券)的重复消息，未获取到锁的直接跳过（另一条会落库，唯一索引兜底）
+            log.warn("未获取到锁，跳过本次下单: userId={}, voucherId={}", userId, voucherId);
             return;
         }
 
