@@ -29,6 +29,8 @@ public class RedisConstants {
     public static final String SECKILL_STOCK_KEY = "seckill:stock:";
     public static final String SECKILL_BEGIN_KEY = "seckill:begin:";
     public static final String SECKILL_END_KEY = "seckill:end:";
+    /** 秒杀回滚标记 key 前缀：seckill:rollback:{orderId}，以订单为粒度保证补偿只生效一次 */
+    public static final String SECKILL_ROLLBACK_MARKER_KEY = "seckill:rollback:";
     public static final String BLOG_LIKED_KEY = "blog:liked:";
     public static final String FEED_KEY = "feed:";
     public static final String SHOP_GEO_KEY = "shop:geo:";

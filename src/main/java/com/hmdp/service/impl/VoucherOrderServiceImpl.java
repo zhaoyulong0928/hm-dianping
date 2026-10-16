@@ -27,6 +27,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.interceptor.TransactionAspectSupport;
 
 import javax.annotation.Resource;
+import java.util.Arrays;
 import java.util.Collections;
 
 /**
@@ -56,11 +57,20 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     // 作用是加载lua脚本，用于秒杀，lua脚本中不能直接操作全局变量，只能操作局部变量，所以需要将参数赋值给局部变量
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
 
+    // 加载幂等回滚脚本：SETNX 标记 + 库存回增 + 移除一人一单记录，单脚本原子完成
+    private static final DefaultRedisScript<Long> ROLLBACK_SCRIPT;
+
+    /** 回滚标记存活时间（秒）：远大于任何补偿路径的重试周期，过期自动清理，无需人工回收 */
+    private static final long ROLLBACK_MARKER_TTL_SECONDS = 24 * 60 * 60L;
+
     // 放在静态代码块里面，确保在类加载时加载lua脚本，避免在运行时加载lua脚本，导致性能问题
     static {
         SECKILL_SCRIPT = new DefaultRedisScript<>();
         SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
         SECKILL_SCRIPT.setResultType(Long.class);
+        ROLLBACK_SCRIPT = new DefaultRedisScript<>();
+        ROLLBACK_SCRIPT.setLocation(new ClassPathResource("rollbackSeckill.lua"));
+        ROLLBACK_SCRIPT.setResultType(Long.class);
     }
 
     @Override
@@ -101,7 +111,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         } catch (AmqpException e) {
             // 同步发送失败（如连接异常），回滚 Redis 中的库存与一人一单记录，避免脏数据
             log.error("秒杀订单消息发送异常，回滚库存: orderId={}", orderId, e);
-            rollbackSeckill(voucherId, userId);
+            rollbackSeckill(orderId, voucherId, userId);
             return Result.fail("下单失败，请重试");
         }
         // 6.返回订单id
@@ -133,7 +143,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
             log.error("库存不足终态失败，补偿回滚 Redis: voucherId={}, userId={}",
                     msg.getVoucherId(), msg.getUserId());
-            rollbackSeckill(msg.getVoucherId(), msg.getUserId());
+            rollbackSeckill(msg.getId(), msg.getVoucherId(), msg.getUserId());
         }
     }
 
@@ -182,10 +192,29 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
 
     /**
-     * 回滚 Redis 中的库存与一人一单记录（用于消息发送失败补偿）
+     * 回滚 Redis 中的库存与一人一单记录（幂等，可被多个失败路径安全共用）
+     *
+     * 以 orderId 为粒度 SET NX 抢占回滚权：同一订单无论重试多少次、被几条失败路径
+     * （生产端同步异常 / 消费端终态补偿 / 未来的 nack、return、死信消费者）触发，
+     * 回滚只生效一次，防止库存被重复 +1 虚增导致超发；
+     * 回滚动作（库存 +1、SREM 用户）在脚本内原子完成，不存在"回滚一半"的中间态
+     *
+     * @return true = 本次执行了回滚；false = 已被其他路径回滚过，本次被幂等拦截
      */
-    private void rollbackSeckill(Long voucherId, Long userId) {
-        stringRedisTemplate.opsForValue().increment(RedisConstants.SECKILL_STOCK_KEY + voucherId, 1);
-        stringRedisTemplate.opsForSet().remove("seckill:order:" + voucherId, userId.toString());
+    private boolean rollbackSeckill(Long orderId, Long voucherId, Long userId) {
+        Long result = stringRedisTemplate.execute(
+                ROLLBACK_SCRIPT,
+                Arrays.asList(
+                        RedisConstants.SECKILL_ROLLBACK_MARKER_KEY + orderId, // 回滚标记
+                        RedisConstants.SECKILL_STOCK_KEY + voucherId,        // 库存
+                        "seckill:order:" + voucherId                          // 一人一单记录
+                ),
+                userId.toString(), String.valueOf(ROLLBACK_MARKER_TTL_SECONDS)
+        );
+        boolean rolledBack = result != null && result == 1L;
+        if (!rolledBack) {
+            log.warn("重复回滚被幂等拦截: orderId={}, voucherId={}, userId={}", orderId, voucherId, userId);
+        }
+        return rolledBack;
     }
 }
