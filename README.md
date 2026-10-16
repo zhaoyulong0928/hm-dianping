@@ -68,6 +68,7 @@ git diff master feature/refactor
 - [x] 商户查询增加缓存穿透主动防线：参数校验 + 布隆过滤器（Redisson RBloomFilter，启动全量加载）
 - [x] 延迟双删第二删升级为 RabbitMQ 延迟队列（TTL + 死信）可靠执行：消息持久化、宕机不丢、失败重试后进死信队列告警/人工补偿
 - [x] 缓存延迟双删第二次删除改为「MQ 可靠路径 + 本地兜底」双保险：发送侧补 `CorrelationData`，并用本地延迟删除兜住「消息到达 broker 之前失败（同步异常/nack/路由失败）」的盲区
+- [x] 登录安全加固：验证码一次性消费 + 发送频控 + 失败锁定（限用 / 限发 / 限猜）
 
 ## 改造记录
 
@@ -85,3 +86,4 @@ git diff master feature/refactor
 | 2026-10-14 | 延迟双删第二删升级为 RabbitMQ 延迟队列可靠执行：移除本地 `ScheduledThreadPoolExecutor` 定时删除（一次性执行、宕机即丢），改为事务提交后发送 `CacheDeleteMsg` 到延迟队列（`x-message-ttl=500ms` + 死信投递），由 `CacheDeleteListener` 消费执行二次删除；消息持久化在 RabbitMQ，进程宕机不丢；删除失败走全局重试拦截器（3 次）后进入 `cache.dlx.queue` 供告警/人工补偿；删除 key 幂等，可安全重试（新增 `CacheDeleteMsg` / `CacheDeleteListener`，改造 `ShopServiceImpl` / `RabbitMQConfig` / `MqConstants`） |
 | 2026-10-14 | 修复逻辑过期方案「数据删除」边界缺陷：异步重建时若数据库已无数据（`dbFallback` 返回 null），直接删除缓存 key 而非写入 `data=null` 的 `RedisData`——Jackson `non_null` 会丢弃 `data` 字段，下次读取时 `(JSONObject) null` 反序列化抛 `ClassCastException`，且新 `expireTime` 在未来导致异常被固化在缓存中；删除 key 后由 miss 自愈路径重新查库返回「店铺不存在」，行为一致（`CacheClient`） |
 | 2026-10-15 | 缓存延迟双删第二次删除改为「MQ 可靠路径 + 本地兜底」双保险：在原有 MQ 延迟队列的基础上，恢复本地 `ScheduledThreadPoolExecutor` 兜底删除（闲时回收 + `@PreDestroy` 优雅关闭），两条路径互为盲区补位——本地兜住「消息到达 broker 之前失败（同步异常 / broker nack / 路由失败）」，MQ 兜住「本地任务执行前进程宕机」；删除 key 幂等，重复执行无副作用。同时发送侧补 `CorrelationData(key)`，便于 confirm 回调定位失败消息（`ShopServiceImpl`） |
+| 2026-10-15 | 登录安全加固（秒杀防脚本的前提层，对应验证码攻击面「限发 / 限猜 / 限用」三环节）：① 验证码校验通过后立即删除（一次性消费，关闭 2 分钟重放窗口，一个 code 不能再换取多个 token）；② `sendCode` 增加发送频控——复用验证码 2 分钟 TTL 作为天然冷却期，未过期拒绝重发（防短信轰炸/刷接口）；③ 登录失败计数：连续失败 5 次锁定 120 秒（与验证码有效期对齐），防 6 位验证码暴力枚举（无锁定时 10⁶ 组合约 8300 QPS 即可在有效期内穷举）（`UserServiceImpl`） |

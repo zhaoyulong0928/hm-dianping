@@ -52,6 +52,10 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
             // 2.如果不符合，返回错误信息
             return Result.fail("手机号格式错误！");
         }
+        // 2.1.发送频控：验证码未过期则拒绝重发（复用 2 分钟 TTL 作为天然冷却期，防短信轰炸）
+        if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(LOGIN_CODE_KEY + phone))) {
+            return Result.fail("验证码发送过于频繁，请稍后再试");
+        }
         // 3.符合，生成验证码
         String code = RandomUtil.randomNumbers(6);
 
@@ -73,12 +77,23 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
             return Result.fail("手机号格式错误！");
         }
         // 3.从redis获取验证码并校验
+        // 3.0.失败锁定：连续失败 5 次则拒绝登录（120 秒窗口，与验证码有效期对齐，防暴力枚举）
+        String failKey = "login:fail:" + phone;
+        String failCount = stringRedisTemplate.opsForValue().get(failKey);
+        if (failCount != null && Integer.parseInt(failCount) >= 5) {
+            return Result.fail("失败次数过多，请 2 分钟后再试");
+        }
         String cacheCode = stringRedisTemplate.opsForValue().get(LOGIN_CODE_KEY + phone);
         String code = loginForm.getCode();
         if (cacheCode == null || !cacheCode.equals(code)) {
-            // 不一致，报错
+            // 3.1.不一致：失败计数 +1（窗口与验证码一致），报错
+            stringRedisTemplate.opsForValue().increment(failKey);
+            stringRedisTemplate.expire(failKey, 120, TimeUnit.SECONDS);
             return Result.fail("验证码错误");
         }
+        // 3.2.一致：验证码一次性消费（删除防 2 分钟重放）+ 清除失败计数
+        stringRedisTemplate.delete(LOGIN_CODE_KEY + phone);
+        stringRedisTemplate.delete(failKey);
 
         // 4.一致，根据手机号查询用户 select * from tb_user where phone = ?
         User user = query().eq("phone", phone).one();
