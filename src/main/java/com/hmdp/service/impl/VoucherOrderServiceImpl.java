@@ -111,7 +111,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         } catch (AmqpException e) {
             // 同步发送失败（如连接异常），回滚 Redis 中的库存与一人一单记录，避免脏数据
             log.error("秒杀订单消息发送异常，回滚库存: orderId={}", orderId, e);
-            rollbackSeckill(orderId, voucherId, userId);
+            rollbackSeckill("order:" + orderId, voucherId, userId);
             return Result.fail("下单失败，请重试");
         }
         // 6.返回订单id
@@ -143,7 +143,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
             log.error("库存不足终态失败，补偿回滚 Redis: voucherId={}, userId={}",
                     msg.getVoucherId(), msg.getUserId());
-            rollbackSeckill(msg.getId(), msg.getVoucherId(), msg.getUserId());
+            rollbackSeckill("order:" + msg.getId(), msg.getVoucherId(), msg.getUserId());
         }
     }
 
@@ -194,26 +194,28 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     /**
      * 回滚 Redis 中的库存与一人一单记录（幂等，可被多个失败路径安全共用）
      *
-     * 以 orderId 为粒度 SET NX 抢占回滚权：同一订单无论重试多少次、被几条失败路径
-     * （生产端同步异常 / 消费端终态补偿 / 未来的 nack、return、死信消费者）触发，
-     * 回滚只生效一次，防止库存被重复 +1 虚增导致超发；
-     * 回滚动作（库存 +1、SREM 用户）在脚本内原子完成，不存在"回滚一半"的中间态
+     * Lua 三重防线：SISMEMBER 业务守卫（用户已不占坑 = 已被其他路径回滚，跳过）
+     * → SET NX EX 幂等闸门（同一 rollbackToken 只回滚一次）
+     * → INCRBY + SREM 原子回滚（无"回滚一半"中间态）
      *
-     * @return true = 本次执行了回滚；false = 已被其他路径回滚过，本次被幂等拦截
+     * rollbackToken 取值约定：订单维度 "order:{orderId}"（生产端同步失败 / 消费端终态补偿 /
+     * 未来的死信消费者），对账维度 "recon:{vid}:{uid}"（定时对账任务）
      */
-    private boolean rollbackSeckill(Long orderId, Long voucherId, Long userId) {
+    @Override
+    public boolean rollbackSeckill(String rollbackToken, Long voucherId, Long userId) {
         Long result = stringRedisTemplate.execute(
                 ROLLBACK_SCRIPT,
                 Arrays.asList(
-                        RedisConstants.SECKILL_ROLLBACK_MARKER_KEY + orderId, // 回滚标记
-                        RedisConstants.SECKILL_STOCK_KEY + voucherId,        // 库存
-                        "seckill:order:" + voucherId                          // 一人一单记录
+                        RedisConstants.SECKILL_ROLLBACK_MARKER_KEY + rollbackToken, // 回滚标记
+                        RedisConstants.SECKILL_STOCK_KEY + voucherId,              // 库存
+                        "seckill:order:" + voucherId                               // 一人一单记录
                 ),
                 userId.toString(), String.valueOf(ROLLBACK_MARKER_TTL_SECONDS)
         );
         boolean rolledBack = result != null && result == 1L;
         if (!rolledBack) {
-            log.warn("重复回滚被幂等拦截: orderId={}, voucherId={}, userId={}", orderId, voucherId, userId);
+            log.warn("回滚未执行(无占坑或本token已回滚): token={}, voucherId={}, userId={}",
+                    rollbackToken, voucherId, userId);
         }
         return rolledBack;
     }

@@ -74,6 +74,7 @@ git diff master feature/refactor
 - [x] 秒杀订单落库顺序修正：订单插入前置于库存扣减，封死「扣库存无订单」脏提交窗口
 - [x] 秒杀消费端终态失败（库存不足）就地补偿：手动标记事务回滚 + 回滚 Redis 后正常 ack，死信队列退化为「仅承接基础设施故障、有消息即告警」的健康仪表盘
 - [x] 秒杀回滚幂等化：`rollbackSeckill` 合并为 Lua 单脚本原子执行 + orderId 粒度 SETNX 防重，多条失败路径/多次重试共用不虚增库存
+- [x] 秒杀定时对账（anti-entropy）：兜底 confirm 丢失/进程蒸发等静默漂移，两阶段裁决防在途误伤，实弹修复 7 天前 voucher-11 历史漂移
 
 ## 改造记录
 
@@ -97,3 +98,4 @@ git diff master feature/refactor
 | 2026-10-16 | 秒杀订单落库顺序修正：订单插入前置于库存扣减——并发重复消息在扣库存之前即被唯一索引拦截，即使 `DuplicateKeyException` 被外层 catch 吞掉、事务照常提交，事务内也未发生任何写操作，封死「扣库存无订单」的脏提交窗口（解锁早于事务提交 + MVCC 快照读看不见未提交订单，重复消息可绕过查重直达 save）；库存不足时抛异常回滚含订单的整个事务，重试耗尽进死信队列（`VoucherOrderServiceImpl`） |
 | 2026-10-16 | 秒杀消费端区分「终态失败 vs 瞬时故障」：库存不足（Redis/DB 账本漂移所致，lua 前置校验后概率≈0，重试无意义）不再走「重试 3 次 → 死信」路径，改为 catch `IllegalStateException` 就地了结——`TransactionAspectSupport.setRollbackOnly()` 手动标记回滚（防 catch 吞异常后 save 的 INSERT 随事务提交成「有订单没扣库存」脏数据）+ `rollbackSeckill` 补偿回滚 Redis 库存与一人一单记录后正常 ack；补偿自身失败仍自然回落到重试/死信路径（Redis 故障期间自动降级为告警模式）；死信队列因此退化为「仅承接基础设施故障（DB/Redis 抖动超重试窗口、毒消息）、有消息即告警」的健康仪表盘，历史测试死信已清除归零（`VoucherOrderServiceImpl`） |
 | 2026-10-16 | 秒杀回滚幂等化：`rollbackSeckill` 由两条独立命令（INCRBY + SREM）改为 `rollbackSeckill.lua` 单脚本原子执行，消除「INCRBY 成功后 SREM 失败、重试再次 INCRBY」的库存虚增隐患；并以 orderId 粒度 `SET NX EX`（TTL 24h）抢占回滚权——同一订单无论重试多少次、被几条失败路径（生产端同步异常 / 消费端终态补偿 / 后续的 confirm nack、return、死信消费者）触发，回滚只生效一次；返回是否实际回滚，重复触发记 warn 日志便于观测补偿路径异常。orderId 全局唯一天然隔离新旧订单，先补偿旧单、用户重新下单、再补偿新单的时序下账目依然一比一配对（新增 `rollbackSeckill.lua`，改造 `VoucherOrderServiceImpl` / `RedisConstants`；已用 redis-cli 实测首次回滚/重复回滚/新订单回滚三种时序） |
+| 2026-10-17 | 秒杀定时对账（anti-entropy）：新增 `SeckillReconciliationTask`（`@Scheduled` 60s），兜住「Redis 占坑 + DB 永无订单」的全部静默漂移（confirm 丢失半开连接/进程蒸发、nack/return 仅日志的残余、未知路径）。三轮设计：① 守卫——消费者不在线/队列有在途消息/死信未清空任一命中本轮跳过（死信让位为保守策略，生产演进按券隔离）；② 扫描——SCAN 占坑集合 + 每券一次 IN 查询；③ 两阶段裁决——嫌疑 key `seckill:recon:suspect:{vid}:{uid}` value 存首见时间戳，显式宽限 60s（在途上限~10s 的 6 倍）后复查仍无单才确认漂移，告警 + 幂等补偿。配套升级回滚基建：`rollbackSeckill` 提为接口方法、参数 `orderId→rollbackToken`（`order:{orderId}` / `recon:{vid}:{uid}` 两种令牌区分来源）、Lua 增加前置 SISMEMBER 业务守卫（堵死信补偿与对账补偿跨令牌双重回滚，且守卫先于幂等闸门不白耗令牌）；`requested-heartbeat` 60s→10s 缩短半开静默期（新增 `SeckillReconciliationTask`，改造 `rollbackSeckill.lua` / `IVoucherOrderService` / `VoucherOrderServiceImpl` / `HmDianPingApplication` / `RedisConstants` / `application.yaml`）。验证：redis-cli 五场景（未占坑/首次/同令牌/异令牌跨路径/新单配对）全过；应用冒烟两轮实弹修复 2026-10-10 遗留的 voucher-11 漂移（51:05 标记嫌疑 → 52:05 确认补偿，首见 60021ms，stock 恢复、SREM 落账、marker `recon:11:1012` 写入，voucher-10 正常账目零误伤） |

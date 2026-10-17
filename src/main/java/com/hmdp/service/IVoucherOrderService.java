@@ -15,4 +15,15 @@ import com.baomidou.mybatisplus.extension.service.IService;
 public interface IVoucherOrderService extends IService<VoucherOrder> {
 
     Result seckillVoucher(Long voucherId);
+
+    /**
+     * 回滚 Redis 中的秒杀预扣（库存 +1、移除一人一单占坑），幂等，可被多个失败路径安全共用
+     *
+     * @param rollbackToken 回滚资格令牌：订单维度用 "order:{orderId}"，对账维度用 "recon:{vid}:{uid}"，
+     *                      同一 token 只能回滚一次（Lua 幂等闸门）
+     * @param voucherId     优惠券 id
+     * @param userId        用户 id
+     * @return true = 本次执行了回滚；false = 用户已不占坑或本 token 已回滚过（被幂等拦截）
+     */
+    boolean rollbackSeckill(String rollbackToken, Long voucherId, Long userId);
 }
