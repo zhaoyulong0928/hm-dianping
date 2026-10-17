@@ -1,6 +1,8 @@
 package com.hmdp.task;
 
+import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
+import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.MqConstants;
 import com.hmdp.utils.RedisConstants;
@@ -30,6 +32,7 @@ import java.util.stream.Collectors;
  *
  * 单轮流程：
  *   Phase 0 守卫 —— 消费者不在线 / 队列有在途消息 / 死信未清空（人工优先），任一命中本轮跳过
+ *   基线断言 —— 以 DB 券列表驱动，校验「Redis 剩余库存 == DB 剩余库存」，只告警不修复
  *   Phase 1 扫描 —— SCAN seckill:order:* 取占坑用户，按券一次 IN 查询 DB 得「有单用户集」
  *   Phase 2 裁决 —— 两阶段确认（suspect-then-confirm）：
  *     · DB 有单 → 账实相符，清嫌疑
@@ -67,11 +70,23 @@ public class SeckillReconciliationTask {
     private StringRedisTemplate stringRedisTemplate;
     @Resource
     private IVoucherOrderService voucherOrderService;
+    @Resource
+    private ISeckillVoucherService seckillVoucherService;
 
     @Scheduled(fixedDelay = 60_000, initialDelay = 60_000)
     public void reconcile() {
         if (!guardsPassed()) {
             return;
+        }
+        // 基线断言（账本级）：以 DB 券列表驱动 —— 占坑集合已清空 / key 丢失的券
+        // （漂移已自愈、Redis 数据丢失）不在下方 SCAN 范围内，只有 DB 能枚举出它们
+        for (SeckillVoucher voucher : seckillVoucherService.list()) {
+            try {
+                assertBaseline(voucher.getVoucherId(), voucher.getStock());
+            } catch (Exception e) {
+                // 单券断言异常不拖垮整轮（如 Redis/DB 抖动）
+                log.error("[秒杀对账] 基线断言异常: vid={}", voucher.getVoucherId(), e);
+            }
         }
         Set<String> orderSetKeys = scanOrderSetKeys();
         for (String setKey : orderSetKeys) {
@@ -162,6 +177,23 @@ public class SeckillReconciliationTask {
                 continue;
             }
             judgeSuspect(voucherId, userId);
+        }
+    }
+
+    /**
+     * 基线断言：稳态下 Redis 剩余库存应等于 DB 剩余库存（守卫已保证队列无在途，
+     * 一笔单要么两边各扣一次、要么被补偿两边都不扣，故两数必然相等）。
+     * 不等 = 有绕过正常链路的改动（人工改库 / Redis 数据丢失 / 旧值残留）。
+     * 只告警不自动修复：无法程序化裁决信 Redis 还是信 DB（两个方向修复相反），
+     * 人工按 SOP 重灌（SET seckill:stock:{vid} = DB 库存值）后下一轮自然安静。
+     * redisStock == null（key 不存在）同样告警：Redis 数据丢失也属基线漂移
+     */
+    private void assertBaseline(Long voucherId, Integer dbStock) {
+        String redisStock = stringRedisTemplate.opsForValue()
+                .get(RedisConstants.SECKILL_STOCK_KEY + voucherId);
+        if (redisStock == null || Long.parseLong(redisStock) != dbStock) {
+            log.error("[秒杀对账][告警] 库存基线漂移: vid={}, redis={}, db={}, 请人工裁决后重灌",
+                    voucherId, redisStock, dbStock);
         }
     }
 
