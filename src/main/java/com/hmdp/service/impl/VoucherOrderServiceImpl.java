@@ -131,6 +131,14 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         voucherOrder.setVoucherId(msg.getVoucherId());
         try {
             createVoucherOrder(voucherOrder);
+            // 落库终检：消费期间占坑被补偿（极端场景：消费卡顿超过对账宽限期，
+            // 被对账任务误判漂移先行补偿）。本单已无对应预扣，若提交会变成
+            // "有单无占坑"的幽灵订单 → 手动标记回滚（订单 + 扣库存一并撤销），
+            // 消息正常确认：资格已退还用户可重新下单，重试本消息无意义
+            if (!isSeckillOccupied(msg.getVoucherId(), msg.getUserId())) {
+                log.warn("落库期间占坑已被补偿，撤销本单: {}", msg);
+                TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+            }
         } catch (DuplicateKeyException e) {
             // 唯一索引兜底：重复消息直接忽略（幂等），正常确认不重试。
             // save 已前置于扣库存，此时事务内未发生任何写操作，提交无副作用
@@ -150,6 +158,13 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private void createVoucherOrder(VoucherOrder voucherOrder) {
         Long userId = voucherOrder.getUserId();
         Long voucherId = voucherOrder.getVoucherId();
+        // 资格预检：占坑记录已被某条补偿路径回滚（如对账任务误补偿），
+        // 说明本消息对应的预扣资格已退还用户（可重新下单），
+        // 此时落库会制造"有单无占坑 + 库存漂移"的幽灵订单，直接跳过，正常确认消息
+        if (!isSeckillOccupied(voucherId, userId)) {
+            log.warn("占坑已被补偿回滚，跳过落库: userId={}, voucherId={}", userId, voucherId);
+            return;
+        }
         // 创建锁对象（锁粒度 = 用户 + 券：只有同一(用户,券)的重复消息才互斥；
         // 同一用户抢不同券的合法并发互不干扰，避免"抢锁失败即跳过"误杀正常订单）
         RLock redisLock = redissonClient.getLock("lock:order:" + userId + ":" + voucherId);
@@ -218,5 +233,14 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     rollbackToken, voucherId, userId);
         }
         return rolledBack;
+    }
+
+    /**
+     * 检查用户是否仍持有该券的一人一单占坑记录
+     * （与 seckill.lua 的 SADD / rollbackSeckill.lua 的 SREM 对应）
+     */
+    private boolean isSeckillOccupied(Long voucherId, Long userId) {
+        return Boolean.TRUE.equals(stringRedisTemplate.opsForSet()
+                .isMember("seckill:order:" + voucherId, userId.toString()));
     }
 }

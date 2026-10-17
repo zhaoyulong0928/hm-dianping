@@ -38,7 +38,9 @@ import java.util.stream.Collectors;
  *
  * 设计要点：
  *   · 宽限期显式判断（elapsed >= GRACE_MS）而非依赖调度间隔，手动触发/多实例也安全；
- *     在途上限 = 消费(毫秒级) + 重试3次(退避1s+2s) ≈ 10s << 60s（6 倍余量）
+ *     常规在途（消费 + 重试退避）仅秒级 << 60s；极端在途（如 DB 行锁等待 50s×3 次 ≈ 153s）
+ *     可能超过宽限期，由消费端占坑双检兜底（见 VoucherOrderServiceImpl 落库前后 SISMEMBER
+ *     校验）：即使误补偿先发生，消费端也会放弃/撤销落库，不产生"有单无占坑"的幽灵订单
  *   · 补偿令牌用 "recon:{vid}:{uid}"：同一(用户,券)同时最多一单在途（lua SISMEMBER 拦截），
  *     二元组是安全代理键；与订单维度令牌 "order:{orderId}" 天然区分来源
  *   · 死信非空时整轮让位为保守策略：一条无关死信会停摆全部对账。
@@ -88,10 +90,12 @@ public class SeckillReconciliationTask {
     private boolean guardsPassed() {
         QueueInformation orderQueue = amqpAdmin.getQueueInfo(MqConstants.SECKILL_ORDER_QUEUE);
         if (orderQueue == null || orderQueue.getConsumerCount() == 0) {
+            //消费者全挂了，消息全堆在队列里，此刻“占坑无单”遍地都是，但都是在途
             log.warn("[秒杀对账] 消费者不在线，消息可能在队列堆积，本轮跳过");
             return false;
         }
         if (orderQueue.getMessageCount() > 0) {
+            //队列里哪怕还有 1 条消息，它可能就是那个“占坑无单”用户的消息
             log.info("[秒杀对账] 秒杀队列存在 {} 条在途消息，本轮跳过", orderQueue.getMessageCount());
             return false;
         }
@@ -107,6 +111,9 @@ public class SeckillReconciliationTask {
 
     /**
      * SCAN 一人一单占坑集合 key（不用 KEYS，避免阻塞 Redis 主线程）
+     * `KEYS` 是 O(N) 阻塞命令 ——扫描期间 Redis 主线程不干别的，
+     * 生产上大 keyspace 一把 KEYS 能卡死整个 Redis。
+     * `SCAN` 用游标分批（`count(200)` 每批建议扫 200 个 slot），随时让路给正常请求
      */
     private Set<String> scanOrderSetKeys() {
         return stringRedisTemplate.execute((RedisCallback<Set<String>>) connection -> {
@@ -132,10 +139,12 @@ public class SeckillReconciliationTask {
             log.warn("[秒杀对账] 无法从 key 解析券 id，跳过: {}", setKey);
             return;
         }
+        //作用：获取占坑集合中的所有用户 ID 字符串
         Set<String> members = stringRedisTemplate.opsForSet().members(setKey);
         if (members == null || members.isEmpty()) {
             return;
         }
+        //作用：将占坑集合中的字符串转换为 Long 类型的用户 ID 列表
         List<Long> memberIds = members.stream().map(Long::parseLong).collect(Collectors.toList());
         // 每券一次 IN 查询（唯一索引 uk_user_voucher 点查），得「已落单用户集」
         Set<Long> orderedUserIds = voucherOrderService.query()
