@@ -12,8 +12,6 @@ import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
 import org.springframework.amqp.AmqpException;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
@@ -47,8 +45,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     @Resource
     private RedisIdWorker redisIdWorker;
-    @Resource
-    private RedissonClient redissonClient;
     @Resource
     private StringRedisTemplate stringRedisTemplate;
     @Resource
@@ -165,44 +161,27 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             log.warn("占坑已被补偿回滚，跳过落库: userId={}, voucherId={}", userId, voucherId);
             return;
         }
-        // 创建锁对象（锁粒度 = 用户 + 券：只有同一(用户,券)的重复消息才互斥；
-        // 同一用户抢不同券的合法并发互不干扰，避免"抢锁失败即跳过"误杀正常订单）
-        RLock redisLock = redissonClient.getLock("lock:order:" + userId + ":" + voucherId);
-        // 尝试获取锁
-        boolean isLock = redisLock.tryLock();
-        // 判断
-        if (!isLock) {
-            // 并发下同一(用户,券)的重复消息，未获取到锁的直接跳过（另一条会落库，唯一索引兜底）
-            log.warn("未获取到锁，跳过本次下单: userId={}, voucherId={}", userId, voucherId);
+        // 1.查询订单
+        int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+        // 1.1.判断是否存在
+        if (count > 0) {
+            // 用户已经购买过了
+            log.warn("用户已购买过，忽略: userId={}, voucherId={}", userId, voucherId);
             return;
         }
 
-        try {
-            // 1.查询订单
-            int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
-            // 1.1.判断是否存在
-            if (count > 0) {
-                // 用户已经购买过了
-                log.warn("用户已购买过，忽略: userId={}, voucherId={}", userId, voucherId);
-                return;
-            }
+        // 2.创建订单（前置于扣库存：并发重复消息在扣库存之前就会被唯一索引 uk_user_voucher 拦截，
+        // 即使异常被外层 catch 吞掉后事务照常提交，事务内也未发生任何写操作，不会出现"扣库存无订单"的脏提交）
+        save(voucherOrder);
 
-            // 2.创建订单（前置于扣库存：并发重复消息在扣库存之前就会被唯一索引拦截，
-            // 即使异常被外层 catch 吞掉后事务照常提交，事务内也未发生任何写操作，不会出现"扣库存无订单"的脏提交）
-            save(voucherOrder);
-
-            // 3.扣减库存
-            boolean success = seckillVoucherService.update()
-                    .setSql("stock = stock - 1") // set stock = stock - 1
-                    .eq("voucher_id", voucherId).gt("stock", 0) // where id = ? and stock > 0
-                    .update();
-            if (!success) {
-                // 扣减失败：抛出异常回滚整个事务（含已插入的订单），重试耗尽后进死信队列
-                throw new IllegalStateException("库存不足");
-            }
-        } finally {
-            // 释放锁
-            redisLock.unlock();
+        // 3.扣减库存
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1") // set stock = stock - 1
+                .eq("voucher_id", voucherId).gt("stock", 0) // where id = ? and stock > 0
+                .update();
+        if (!success) {
+            // 扣减失败：抛出异常回滚整个事务（含已插入的订单），重试耗尽后进死信队列
+            throw new IllegalStateException("库存不足");
         }
     }
 
