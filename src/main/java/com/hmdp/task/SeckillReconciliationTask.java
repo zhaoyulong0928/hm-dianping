@@ -42,6 +42,8 @@ import java.util.stream.Collectors;
  * 设计要点：
  *   · 宽限期显式判断（elapsed >= GRACE_MS）而非依赖调度间隔，手动触发/多实例也安全；
  *     常规在途（消费 + 重试退避）仅秒级 << 60s；极端在途（如 DB 行锁等待 50s×3 次 ≈ 153s）
+ *     `50s` 是 MySQL InnoDB 的`innodb_lock_wait_timeout` 默认值—— 
+ *     当一个事务去 UPDATE 时撞上了别的行锁，会最多傻等 50 秒才报"锁等待超时" 。
  *     可能超过宽限期，由消费端占坑双检兜底（见 VoucherOrderServiceImpl 落库前后 SISMEMBER
  *     校验）：即使误补偿先发生，消费端也会放弃/撤销落库，不产生"有单无占坑"的幽灵订单
  *   · 补偿令牌用 "recon:{vid}:{uid}"：同一(用户,券)同时最多一单在途（lua SISMEMBER 拦截），
@@ -73,13 +75,19 @@ public class SeckillReconciliationTask {
     @Resource
     private ISeckillVoucherService seckillVoucherService;
 
-    @Scheduled(fixedDelay = 60_000, initialDelay = 60_000)
+    @Scheduled(fixedDelay = 60_000, initialDelay = 60_000)//每 60 秒执行一次，应用启动后 60 秒后开始，避免还没就绪的窗口
+    /**
+     * 秒杀定时对账任务（anti-entropy）：兜住所有"Redis 已占坑、DB 永无订单"的静默漂移
+     */
     public void reconcile() {
+        //作用：确保"占坑 + 无单"只可能是漂移而非在途
         if (!guardsPassed()) {
             return;
         }
         // 基线断言（账本级）：以 DB 券列表驱动 —— 占坑集合已清空 / key 丢失的券
         // （漂移已自愈、Redis 数据丢失）不在下方 SCAN 范围内，只有 DB 能枚举出它们
+        //对 DB 里的 每一张秒杀券 ，比较`Redis 库存` 和`DB 库存` 是否相等。
+        // 它的覆盖范围天然是“全部券”，不依赖任何 Redis key 是否存在。
         for (SeckillVoucher voucher : seckillVoucherService.list()) {
             try {
                 assertBaseline(voucher.getVoucherId(), voucher.getStock());
@@ -105,7 +113,7 @@ public class SeckillReconciliationTask {
     private boolean guardsPassed() {
         QueueInformation orderQueue = amqpAdmin.getQueueInfo(MqConstants.SECKILL_ORDER_QUEUE);
         if (orderQueue == null || orderQueue.getConsumerCount() == 0) {
-            //消费者全挂了，消息全堆在队列里，此刻“占坑无单”遍地都是，但都是在途
+            //队列不存在或者消费者全挂了，消息全堆在队列里，此刻“占坑无单”遍地都是，但都是在途
             log.warn("[秒杀对账] 消费者不在线，消息可能在队列堆积，本轮跳过");
             return false;
         }
@@ -127,8 +135,9 @@ public class SeckillReconciliationTask {
     /**
      * SCAN 一人一单占坑集合 key（不用 KEYS，避免阻塞 Redis 主线程）
      * `KEYS` 是 O(N) 阻塞命令 ——扫描期间 Redis 主线程不干别的，
-     * 生产上大 keyspace 一把 KEYS 能卡死整个 Redis。
-     * `SCAN` 用游标分批（`count(200)` 每批建议扫 200 个 slot），随时让路给正常请求
+     * 生产上大 keyspace 一把 KEYS 能卡死整个 Redis。`SCAN` 用游标分批（`count(200)` 每批建议扫 200 个 slot），随时让路给正常请求
+     * Redis 是单线程模型，`KEYS` 执行期间别的命令一个都插不进来。
+     * 对一个秒杀系统来说， 在活动高峰期执行 KEYS 等于主动制造一次全站卡顿 。SCAN 就是官方为这个场景设计的替代品。
      */
     private Set<String> scanOrderSetKeys() {
         return stringRedisTemplate.execute((RedisCallback<Set<String>>) connection -> {
@@ -147,6 +156,7 @@ public class SeckillReconciliationTask {
      * Phase 1 + Phase 2：对单个券的占坑集合做比对与裁决
      */
     private void reconcileVoucher(String setKey) {
+        //
         Long voucherId;
         try {
             voucherId = Long.parseLong(setKey.substring(ORDER_SET_PREFIX.length()));
@@ -198,10 +208,12 @@ public class SeckillReconciliationTask {
     }
 
     /**
-     * Phase 2：两阶段裁决单个"占坑无单"用户
+     * Phase 3：两阶段裁决单个"占坑无单"用户
      */
     private void judgeSuspect(Long voucherId, Long userId) {
+        //作用：根据占坑集合 key 和用户 ID 生成嫌疑 key
         String suspectKey = suspectKey(voucherId, userId);
+        //作用：获取嫌疑 key 对应的值（记录首次见时间）
         String firstSeen = stringRedisTemplate.opsForValue().get(suspectKey);
         long now = System.currentTimeMillis();
 
@@ -233,6 +245,10 @@ public class SeckillReconciliationTask {
         }
     }
 
+    /**
+     * 生成嫌疑 key：占坑集合 key + ":" + 用户 ID
+     */
+    //作用：根据占坑集合 key 和用户 ID 生成嫌疑 key
     private String suspectKey(Long voucherId, Long userId) {
         return RedisConstants.SECKILL_RECON_SUSPECT_KEY + voucherId + ":" + userId;
     }
