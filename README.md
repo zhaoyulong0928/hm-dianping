@@ -20,7 +20,7 @@
 
 - **登录认证**：验证码 + Redis Token + 双拦截器，实现无状态会话
 - **商户查询缓存**：缓存穿透（参数校验 + 布隆过滤器）/ 击穿 / 雪崩的处理，Cache Aside 更新策略
-- **优惠券秒杀**：Lua 脚本原子校验 + 分布式锁 + RabbitMQ 消息队列异步下单
+- **优惠券秒杀**：Lua 脚本原子校验 + RabbitMQ 异步下单 + 按订单归属的幂等补偿与定时对账
 - **探店笔记 / 好友关注**：点赞、关注、Feed 流
 - **附近商铺**：基于 Redis GEO 的距离排序与分页
 
@@ -73,10 +73,12 @@ git diff master feature/refactor
 - [x] 秒杀消费端幂等收敛：删除冗余 Redisson 锁，改由「唯一索引 uk_user_voucher + count 前置判重」兜底重复消息（Lua 原子占坑已从源头拦截同用户重复请求）
 - [x] 秒杀订单落库顺序修正：订单插入前置于库存扣减，封死「扣库存无订单」脏提交窗口
 - [x] 秒杀消费端终态失败（库存不足）就地补偿：手动标记事务回滚 + 回滚 Redis 后正常 ack，死信队列退化为「仅承接基础设施故障、有消息即告警」的健康仪表盘
-- [x] 秒杀回滚幂等化：`rollbackSeckill` 合并为 Lua 单脚本原子执行 + orderId 粒度 SETNX 防重，多条失败路径/多次重试共用不虚增库存
-- [x] 秒杀定时对账（anti-entropy）：兜底 confirm 丢失/进程蒸发等静默漂移，两阶段裁决防在途误伤，实弹修复 7 天前 voucher-11 历史漂移
-- [x] 秒杀消费端占坑双检：落库前后 SISMEMBER 校验，封死「对账误补偿 × 在途落库」竞态，杜绝幽灵订单与库存基线漂移
+- [x] 秒杀回滚幂等与订单归属校验：占坑改为 Hash（userId → 字符串 orderId），`rollbackSeckill` 在单个 Lua 中完成归属比较 + SETNX 防重 + 回滚，避免旧补偿误撤销新订单占坑
+- [x] 秒杀定时对账（anti-entropy）：兜底 confirm 丢失/进程蒸发等静默漂移，两阶段裁决防在途误伤；suspect 按订单隔离，实弹修复 7 天前 voucher-11 历史漂移
+- [x] 秒杀消费端占坑双检：落库前后 HEXISTS 校验，封死「对账误补偿 × 在途落库」竞态，杜绝幽灵订单与库存基线漂移
 - [x] 秒杀并发一致性测试：防超卖（100 库存 / 1000 并发）+ 重复消息幂等（同一(用户,券) 5 条消息只落 1 单）（`SeckillConcurrencyTest`）
+- [x] 秒杀两阶段基线测试：真实 HTTP 全链路、时间/库存边界、重复抢购、并发防超卖、重复消息、事务回滚、消费重试/死信、补偿与对账
+- [x] 秒杀旧补偿竞态修复回归：原失败用例保持断言不变并转为通过，两阶段受影响用例 + 新增 suspect 隔离共 14 项针对性回归通过
 
 ## 改造记录
 
@@ -98,6 +100,7 @@ git diff master feature/refactor
 | 2026-10-16 | 秒杀用户级限流：`seckill.lua` 最前置固定窗口限流（`INCR`+`EXPIRE`，每用户每秒最多放行 1 次，返回码 5），在时间/库存/一人一单校验之前拦截并行/高频的脚本请求，不产生任何业务写操作；`VoucherOrderServiceImpl` 增加返回码 5 的降级响应（`seckill.lua` / `VoucherOrderServiceImpl`；另含 lua 文件 EOL 归一化 CRLF→LF 及 Redis Cluster 适用性注释） |
 | 2026-10-16 | 秒杀订单落库顺序修正：订单插入前置于库存扣减——并发重复消息在扣库存之前即被唯一索引拦截，即使 `DuplicateKeyException` 被外层 catch 吞掉、事务照常提交，事务内也未发生任何写操作，封死「扣库存无订单」的脏提交窗口（解锁早于事务提交 + MVCC 快照读看不见未提交订单，重复消息可绕过查重直达 save）；库存不足时抛异常回滚含订单的整个事务，重试耗尽进死信队列（`VoucherOrderServiceImpl`） |
 | 2026-10-16 | 秒杀消费端区分「终态失败 vs 瞬时故障」：库存不足（Redis/DB 账本漂移所致，lua 前置校验后概率≈0，重试无意义）不再走「重试 3 次 → 死信」路径，改为 catch `IllegalStateException` 就地了结——`TransactionAspectSupport.setRollbackOnly()` 手动标记回滚（防 catch 吞异常后 save 的 INSERT 随事务提交成「有订单没扣库存」脏数据）+ `rollbackSeckill` 补偿回滚 Redis 库存与一人一单记录后正常 ack；补偿自身失败仍自然回落到重试/死信路径（Redis 故障期间自动降级为告警模式）；死信队列因此退化为「仅承接基础设施故障（DB/Redis 抖动超重试窗口、毒消息）、有消息即告警」的健康仪表盘，历史测试死信已清除归零（`VoucherOrderServiceImpl`） |
-| 2026-10-16 | 秒杀回滚幂等化：`rollbackSeckill` 由两条独立命令（INCRBY + SREM）改为 `rollbackSeckill.lua` 单脚本原子执行，消除「INCRBY 成功后 SREM 失败、重试再次 INCRBY」的库存虚增隐患；并以 orderId 粒度 `SET NX EX`（TTL 24h）抢占回滚权——同一订单无论重试多少次、被几条失败路径（生产端同步异常 / 消费端终态补偿 / 后续的 confirm nack、return、死信消费者）触发，回滚只生效一次；返回是否实际回滚，重复触发记 warn 日志便于观测补偿路径异常。orderId 全局唯一天然隔离新旧订单，先补偿旧单、用户重新下单、再补偿新单的时序下账目依然一比一配对（新增 `rollbackSeckill.lua`，改造 `VoucherOrderServiceImpl` / `RedisConstants`；已用 redis-cli 实测首次回滚/重复回滚/新订单回滚三种时序） |
+| 2026-10-16 | 秒杀回滚幂等化：`rollbackSeckill` 由两条独立命令（INCRBY + SREM）改为 `rollbackSeckill.lua` 单脚本原子执行，消除「INCRBY 成功后 SREM 失败、重试再次 INCRBY」的库存虚增隐患；并以 orderId 粒度 `SET NX EX`（TTL 24h）抢占回滚权——同一 rollbackToken 无论重试多少次都只生效一次；返回是否实际回滚，重复触发记 warn 日志便于观测补偿路径异常。不同 token 只能区分补偿来源，不能证明当前占坑仍属于旧订单，后续于 2026-10-26 补充订单归属校验（新增 `rollbackSeckill.lua`，改造 `VoucherOrderServiceImpl` / `RedisConstants`；已用 redis-cli 实测首次回滚/重复回滚/新订单回滚三种时序） |
 | 2026-10-17 | 秒杀消费端占坑双检：封死「对账误补偿 × 在途落库」竞态——极端在途（DB 行锁等待 50s×3 次 ≈ 153s）可超过对账 60s 宽限期，且 `getQueueInfo().getMessageCount()`（AMQP passive declare 语义）不含已投递未 ack 消息导致守卫放行，误补偿先执行、卡顿消费者醒来后落库，会制造「有单无占坑 + Redis 基线 +1」的幽灵库存：秒杀尾部沦为「lua 过 → DB 拒 → 就地补偿」的假成功死循环，而对账单向扫描（占坑集合→DB 订单）对该反向漂移永久不可见。修复：`createVoucherOrder` 落库前资格预检（占坑已被补偿回滚则跳过落库直接 ack）+ `onOrderMessage` 落库成功后、事务提交前终检（消费期间被补偿则 `setRollbackOnly` 撤销订单与扣库存、正常 ack——资格已退还用户可重新下单，重试无意义）；两检合围补偿可能发生的全部时序（消费前/消费中），正常路径零影响（合法消息占坑恒在），终检与终态失败路径同用 `setRollbackOnly` 模式；对账任务设计注释同步修正「在途上限 ≈ 10s」的不实估算，改为记录分层防御关系（`VoucherOrderServiceImpl` / `SeckillReconciliationTask`，另含对账任务与回滚脚本的学习注释补充） |
 | 2026-10-24 | 秒杀消费端删除冗余 Redisson 分布式锁：Lua 的 `SISMEMBER+SADD` 已原子拦截同(用户,券)重复请求，落库重复由 `uk_user_voucher` 唯一索引抛 `DuplicateKeyException` 兜底；原「抢锁失败即 return」分支会在持锁消息重试耗尽进死信时静默吞消息，故移除。保留 `count` 前置判重以减少无效 INSERT；新增 `SeckillConcurrencyTest`（100 库存/1000 并发防超卖 + 5 条重复消息只落 1 单）（`VoucherOrderServiceImpl` / `SeckillConcurrencyTest`） |
+| 2026-10-26 | 秒杀补偿增加订单归属校验：第二阶段确定性测试复现「旧请求预扣 → 首次补偿 → 同用户重新抢购 → 另一旧路径 token 迟到」导致 Redis 库存多恢复 1、新占坑被误删；根因是 Set 占坑只保存 userId，而 token 只能做补偿来源幂等，不能证明当前占坑归属。最小修复为占坑改 Hash（field=userId、value=字符串 orderId），`rollbackSeckill` 增加 `expectedOrderId`，并在同一个 `rollbackSeckill.lua` 中完成 `HGET` 字符串比对、`SET NX EX`、`INCRBY + HDEL`；对账 suspect key 追加 orderId，独立记录新旧订单宽限期和清理范围，保留 DB 是否已成功落单的判断。原失败用例未改弱断言，修复后返回 false、stock=0、占坑保留；第一阶段 8 项 + 第二阶段原有 5 项 + 新增 suspect 隔离 1 项，共 14 项针对性回归实际通过（`seckill.lua` / `rollbackSeckill.lua` / `IVoucherOrderService` / `VoucherOrderServiceImpl` / `SeckillReconciliationTask` / `RedisConstants`；报告见 `seckill-phase1-baseline-report.md` / `seckill-phase2-baseline-report.md` / `seckill-compensation-fix-report.md`，面试复盘见 `seckill-stale-compensation-interview.md`）。仅在空的专用 Redis 完成类型切换，未验证已有 Set/旧 suspect 在线迁移，不宣称解决全部竞态或达到生产级可靠性 |
