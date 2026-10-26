@@ -31,7 +31,7 @@ public class RedisConstants {
     public static final String SECKILL_END_KEY = "seckill:end:";
     /** 秒杀回滚标记 key 前缀：seckill:rollback:{rollbackToken}，同一令牌的补偿只生效一次 */
     public static final String SECKILL_ROLLBACK_MARKER_KEY = "seckill:rollback:";
-    /** 秒杀对账嫌疑 key 前缀：seckill:recon:suspect:{vid}:{uid}，value 为首见时间戳（两阶段裁决） */
+    /** 秒杀对账嫌疑 key 前缀：seckill:recon:suspect:{vid}:{uid}:{orderId}，value 为首见时间戳 */
     public static final String SECKILL_RECON_SUSPECT_KEY = "seckill:recon:suspect:";
     public static final String BLOG_LIKED_KEY = "blog:liked:";
     public static final String FEED_KEY = "feed:";

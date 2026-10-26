@@ -23,7 +23,8 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
      *                      同一 token 只能回滚一次（Lua 幂等闸门）
      * @param voucherId     优惠券 id
      * @param userId        用户 id
-     * @return true = 本次执行了回滚；false = 用户已不占坑或本 token 已回滚过（被幂等拦截）
+     * @param expectedOrderId 期望回滚的订单 id；仅当前占坑仍属于该订单时才允许回滚
+     * @return true = 本次执行了回滚；false = 占坑不存在/不属于该订单或本 token 已回滚过
      */
-    boolean rollbackSeckill(String rollbackToken, Long voucherId, Long userId);
+    boolean rollbackSeckill(String rollbackToken, Long voucherId, Long userId, String expectedOrderId);
 }

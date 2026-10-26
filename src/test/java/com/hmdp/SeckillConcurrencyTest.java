@@ -12,21 +12,28 @@ import com.hmdp.service.IVoucherService;
 import com.hmdp.task.SeckillReconciliationTask;
 import com.hmdp.utils.MqConstants;
 import com.hmdp.utils.RedisConstants;
+import com.hmdp.utils.ShopBloomFilter;
 import com.hmdp.utils.UserHolder;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.redisson.api.RedissonClient;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ActiveProfiles;
 
 import javax.annotation.Resource;
+import javax.sql.DataSource;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -43,6 +50,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 运行前提：本地需启动 MySQL / Redis / RabbitMQ（见 application.yaml 默认 localhost）。
  */
 @SpringBootTest
+@ActiveProfiles("seckill-test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class SeckillConcurrencyTest {
 
@@ -56,6 +64,8 @@ class SeckillConcurrencyTest {
     private StringRedisTemplate stringRedisTemplate;
     @Resource
     private RabbitTemplate rabbitTemplate;
+    @Resource
+    private DataSource dataSource;
 
     /**
      * 用 Mock 替换对账定时任务：@EnableScheduling 启动的 @Scheduled 线程是非 daemon 的，
@@ -63,9 +73,19 @@ class SeckillConcurrencyTest {
      */
     @MockBean
     private SeckillReconciliationTask reconciliationTask;
+    @MockBean
+    private RedissonClient redissonClient;
+    @MockBean
+    private ShopBloomFilter shopBloomFilter;
 
     /** 记录本测试创建的券 id，供 @AfterEach 清理，保证测试可重复、不污染库 */
     private final List<Long> createdVoucherIds = new ArrayList<>();
+    private final Set<Long> usedUserIds = ConcurrentHashMap.newKeySet();
+
+    @BeforeEach
+    void sampleSessionSqlMode() {
+        System.out.println("TEST_SESSION_SQL_MODE=" + SeckillTestSupport.sessionSqlMode(dataSource));
+    }
 
     /**
      * 准备一张「进行中」的秒杀券：写 DB（tb_voucher / tb_seckill_voucher）并同步 Redis 库存/起止时间。
@@ -125,6 +145,7 @@ class SeckillConcurrencyTest {
 
         for (int i = 0; i < users; i++) {
             final long userId = 1_000_000L + i;
+            usedUserIds.add(userId);
             es.submit(() -> {
                 UserDTO user = new UserDTO();
                 user.setId(userId);
@@ -150,8 +171,10 @@ class SeckillConcurrencyTest {
         done.await(60, TimeUnit.SECONDS);
         es.shutdown();
 
-        // 等 MQ 全部消费落库后再断言
+        // 先等订单数达标，再确认 ready/unacked 均为 0，避免清理与在途消息竞争
         awaitOrderCount(vid, stock);
+        SeckillTestSupport.awaitQueueDrained(
+                System.getenv("SECKILL_TEST_RABBIT_VHOST"), MqConstants.SECKILL_ORDER_QUEUE);
 
         int orderCount = voucherOrderService.query().eq("voucher_id", vid).count();
         Integer dbStock = seckillVoucherService.getById(vid).getStock();
@@ -161,6 +184,8 @@ class SeckillConcurrencyTest {
         assertThat(orderCount).as("DB 落单数，不得超卖").isEqualTo(stock);
         assertThat(dbStock).as("DB 库存归零且不为负").isEqualTo(0);
         assertThat(redisStock).as("Redis 剩余库存应与 DB 一致").isEqualTo(0);
+        System.out.printf("PHASE1_EVIDENCE case=concurrency voucherId=%d users=%d success=%d orders=%d dbStock=%d redisStock=%d%n",
+                vid, users, successCount.get(), orderCount, dbStock, redisStock);
     }
 
     /**
@@ -173,10 +198,12 @@ class SeckillConcurrencyTest {
         int stock = 10;
         Long vid = prepareVoucher(stock);
         long userId = 2_000_000L;
+        usedUserIds.add(userId);
 
         // 模拟 Lua 已完成的「预扣」：Redis 库存 -1 + 占坑
         stringRedisTemplate.opsForValue().decrement(RedisConstants.SECKILL_STOCK_KEY + vid);
-        stringRedisTemplate.opsForSet().add("seckill:order:" + vid, String.valueOf(userId));
+        stringRedisTemplate.opsForHash().put("seckill:order:" + vid,
+                String.valueOf(userId), String.valueOf(9_000_000_000_000L));
 
         int duplicates = 5;
         for (int i = 0; i < duplicates; i++) {
@@ -190,6 +217,8 @@ class SeckillConcurrencyTest {
         }
 
         awaitOrderCount(vid, 1);
+        SeckillTestSupport.awaitQueueDrained(
+                System.getenv("SECKILL_TEST_RABBIT_VHOST"), MqConstants.SECKILL_ORDER_QUEUE);
 
         int orderCount = voucherOrderService.query()
                 .eq("voucher_id", vid).eq("user_id", userId).count();
@@ -199,6 +228,8 @@ class SeckillConcurrencyTest {
         assertThat(orderCount).as("重复消息只应落 1 单").isEqualTo(1);
         assertThat(dbStock).as("DB 库存只扣 1 次").isEqualTo(stock - 1);
         assertThat(redisStock).as("Redis 库存应与 DB 一致").isEqualTo(stock - 1);
+        System.out.printf("PHASE1_EVIDENCE case=duplicate-message voucherId=%d userId=%d sent=%d orders=%d dbStock=%d redisStock=%d%n",
+                vid, userId, duplicates, orderCount, dbStock, redisStock);
     }
 
     private Integer getRedisStock(Long voucherId) {
@@ -219,6 +250,10 @@ class SeckillConcurrencyTest {
                     "seckill:order:" + vid
             ));
         }
+        for (Long userId : usedUserIds) {
+            stringRedisTemplate.delete("seckill:freq:" + userId);
+        }
         createdVoucherIds.clear();
+        usedUserIds.clear();
     }
 }

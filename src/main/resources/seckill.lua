@@ -50,14 +50,14 @@ if(tonumber(redis.call('get', stockKey) or 0) <= 0) then
     -- 5.2.库存不足，返回1
     return 1
 end
--- 5.3.判断用户是否下单 SISMEMBER orderKey userId
-if(redis.call('sismember', orderKey, userId) == 1) then
+-- 5.3.判断用户是否下单：Hash field=userId，value=字符串 orderId
+if(redis.call('hexists', orderKey, userId) == 1) then
     -- 5.4.存在，说明是重复下单，返回2
     return 2
 end
 -- 5.5.扣库存 incrby stockKey -1
 redis.call('incrby', stockKey, -1)
--- 5.6.下单（保存用户）sadd orderKey userId
-redis.call('sadd', orderKey, userId)
+-- 5.6.保存占坑及订单归属；orderId 保持字符串，不转数值
+redis.call('hset', orderKey, userId, orderId)
 -- 5.7.秒杀成功返回0（下单消息改由 Java 侧投递到 RabbitMQ）
 return 0

@@ -1,0 +1,26 @@
+seckill:
+  test:
+    run-id: ${SECKILL_TEST_RUN_ID}
+
+spring:
+  datasource:
+    url: ${SECKILL_TEST_DB_URL}
+    username: ${SECKILL_TEST_DB_USERNAME}
+    password: ${SECKILL_TEST_DB_PASSWORD}
+  redis:
+    host: ${SECKILL_TEST_REDIS_HOST}
+    port: ${SECKILL_TEST_REDIS_PORT:6379}
+    database: ${SECKILL_TEST_REDIS_DB}
+  rabbitmq:
+    host: ${SECKILL_TEST_RABBIT_HOST}
+    port: ${SECKILL_TEST_RABBIT_PORT:5672}
+    username: ${SECKILL_TEST_RABBIT_USERNAME}
+    password: ${SECKILL_TEST_RABBIT_PASSWORD}
+    virtual-host: ${SECKILL_TEST_RABBIT_VHOST}
+  task:
+    scheduling:
+      enabled: false
+
+logging:
+  level:
+    com.hmdp: info

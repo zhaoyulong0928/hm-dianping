@@ -107,7 +107,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         } catch (AmqpException e) {
             // 同步发送失败（如连接异常），回滚 Redis 中的库存与一人一单记录，避免脏数据
             log.error("秒杀订单消息发送异常，回滚库存: orderId={}", orderId, e);
-            rollbackSeckill("order:" + orderId, voucherId, userId);
+            rollbackSeckill("order:" + orderId, voucherId, userId, String.valueOf(orderId));
             return Result.fail("下单失败，请重试");
         }
         // 6.返回订单id
@@ -147,7 +147,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
             log.error("库存不足终态失败，补偿回滚 Redis: voucherId={}, userId={}",
                     msg.getVoucherId(), msg.getUserId());
-            rollbackSeckill("order:" + msg.getId(), msg.getVoucherId(), msg.getUserId());
+            rollbackSeckill("order:" + msg.getId(), msg.getVoucherId(), msg.getUserId(),
+                    String.valueOf(msg.getId()));
         }
     }
 
@@ -186,40 +187,36 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
 
     /**
-     * 回滚 Redis 中的库存与一人一单记录（幂等，可被多个失败路径安全共用）
+     * 回滚 Redis 中的库存与一人一单记录（按订单归属校验，且按 token 幂等）
      *
-     * Lua 三重防线：SISMEMBER 业务守卫（用户已不占坑 = 已被其他路径回滚，跳过）
-     * → SET NX EX 幂等闸门（同一 rollbackToken 只回滚一次）
-     * → INCRBY + SREM 原子回滚（无"回滚一半"中间态）
-     *
-     * rollbackToken 取值约定：订单维度 "order:{orderId}"（生产端同步失败 / 消费端终态补偿 /
-     * 未来的死信消费者），对账维度 "recon:{vid}:{uid}"（定时对账任务）
+     * Lua 先校验当前 Hash 占坑的 orderId 是否仍为 expectedOrderId，再通过 SET NX EX
+     * 幂等闸门执行 INCRBY + HDEL；旧订单补偿不能撤销同用户的新订单占坑。
      */
     @Override
-    public boolean rollbackSeckill(String rollbackToken, Long voucherId, Long userId) {
+    public boolean rollbackSeckill(String rollbackToken, Long voucherId, Long userId, String expectedOrderId) {
         Long result = stringRedisTemplate.execute(
                 ROLLBACK_SCRIPT,
                 Arrays.asList(
-                        RedisConstants.SECKILL_ROLLBACK_MARKER_KEY + rollbackToken, // 回滚标记
-                        RedisConstants.SECKILL_STOCK_KEY + voucherId,              // 库存
-                        "seckill:order:" + voucherId                               // 一人一单记录
+                        RedisConstants.SECKILL_ROLLBACK_MARKER_KEY + rollbackToken,
+                        RedisConstants.SECKILL_STOCK_KEY + voucherId,
+                        "seckill:order:" + voucherId
                 ),
-                userId.toString(), String.valueOf(ROLLBACK_MARKER_TTL_SECONDS)
+                userId.toString(), expectedOrderId, String.valueOf(ROLLBACK_MARKER_TTL_SECONDS)
         );
         boolean rolledBack = result != null && result == 1L;
         if (!rolledBack) {
-            log.warn("回滚未执行(无占坑或本token已回滚): token={}, voucherId={}, userId={}",
-                    rollbackToken, voucherId, userId);
+            log.warn("回滚未执行(占坑不存在/不属于订单或本token已回滚): token={}, voucherId={}, userId={}, expectedOrderId={}",
+                    rollbackToken, voucherId, userId, expectedOrderId);
         }
         return rolledBack;
     }
 
     /**
      * 检查用户是否仍持有该券的一人一单占坑记录
-     * （与 seckill.lua 的 SADD / rollbackSeckill.lua 的 SREM 对应）
+     * （与 seckill.lua 的 HSET / rollbackSeckill.lua 的 HDEL 对应）
      */
     private boolean isSeckillOccupied(Long voucherId, Long userId) {
-        return Boolean.TRUE.equals(stringRedisTemplate.opsForSet()
-                .isMember("seckill:order:" + voucherId, userId.toString()));
+        return Boolean.TRUE.equals(stringRedisTemplate.opsForHash()
+                .hasKey("seckill:order:" + voucherId, userId.toString()));
     }
 }

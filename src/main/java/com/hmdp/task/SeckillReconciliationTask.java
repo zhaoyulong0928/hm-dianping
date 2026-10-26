@@ -19,8 +19,11 @@ import org.springframework.stereotype.Component;
 import javax.annotation.Resource;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -44,21 +47,20 @@ import java.util.stream.Collectors;
  *     常规在途（消费 + 重试退避）仅秒级 << 60s；极端在途（如 DB 行锁等待 50s×3 次 ≈ 153s）
  *     `50s` 是 MySQL InnoDB 的`innodb_lock_wait_timeout` 默认值—— 
  *     当一个事务去 UPDATE 时撞上了别的行锁，会最多傻等 50 秒才报"锁等待超时" 。
- *     可能超过宽限期，由消费端占坑双检兜底（见 VoucherOrderServiceImpl 落库前后 SISMEMBER
- *     校验）：即使误补偿先发生，消费端也会放弃/撤销落库，不产生"有单无占坑"的幽灵订单
- *   · 补偿令牌用 "recon:{vid}:{uid}"：同一(用户,券)同时最多一单在途（lua SISMEMBER 拦截），
- *     二元组是安全代理键；与订单维度令牌 "order:{orderId}" 天然区分来源
+ *     可能超过宽限期，由消费端占坑双检兜底（见 VoucherOrderServiceImpl 落库前后 HEXISTS 校验）
+ *   · 补偿令牌用 "recon:{vid}:{uid}" 区分来源；实际回滚还必须通过 Hash 中的字符串 orderId 归属校验
+ *   · suspect key 追加 orderId，旧订单的更新/清理不会覆盖或删除同用户新订单的嫌疑
  *   · 死信非空时整轮让位为保守策略：一条无关死信会停摆全部对账。
  *     生产演进：解析死信消息体，仅隔离相关 voucherId/userId 的对账
- *   · 单实例假设：补偿幂等（SISMEMBER + rollbackToken 双闸门）保证多实例下正确性不受损，
+ *   · 单实例假设：订单归属校验 + rollbackToken 双闸门保证补偿幂等，
  *     仅重复扫描浪费；多实例部署时应引入 ShedLock
  */
 @Slf4j
 @Component
 public class SeckillReconciliationTask {
 
-    /** 一人一单占坑集合 key 前缀（与 seckill.lua 保持一致） */
-    private static final String ORDER_SET_PREFIX = "seckill:order:";
+    /** 一人一单占坑 Hash key 前缀（field=userId，value=字符串 orderId） */
+    private static final String ORDER_KEY_PREFIX = "seckill:order:";
 
     /** 两阶段裁决宽限期（毫秒）：首次发现无单后至少等待此时长才确认漂移 */
     private static final long GRACE_MS = 60_000L;
@@ -96,13 +98,13 @@ public class SeckillReconciliationTask {
                 log.error("[秒杀对账] 基线断言异常: vid={}", voucher.getVoucherId(), e);
             }
         }
-        Set<String> orderSetKeys = scanOrderSetKeys();
-        for (String setKey : orderSetKeys) {
+        Set<String> orderSetKeys = scanOrderKeys();
+        for (String orderKey : orderSetKeys) {
             try {
-                reconcileVoucher(setKey);
+                reconcileVoucher(orderKey);
             } catch (Exception e) {
                 // 单券异常不拖垮整轮（如 Redis/DB 抖动），嫌疑 key 依赖 TTL 自清理
-                log.error("[秒杀对账] 单券对账异常: setKey={}", setKey, e);
+                log.error("[秒杀对账] 单券对账异常: orderKey={}", orderKey, e);
             }
         }
     }
@@ -139,11 +141,11 @@ public class SeckillReconciliationTask {
      * Redis 是单线程模型，`KEYS` 执行期间别的命令一个都插不进来。
      * 对一个秒杀系统来说， 在活动高峰期执行 KEYS 等于主动制造一次全站卡顿 。SCAN 就是官方为这个场景设计的替代品。
      */
-    private Set<String> scanOrderSetKeys() {
+    private Set<String> scanOrderKeys() {
         return stringRedisTemplate.execute((RedisCallback<Set<String>>) connection -> {
             Set<String> keys = new HashSet<>();
             try (Cursor<byte[]> cursor = connection.scan(
-                    ScanOptions.scanOptions().match(ORDER_SET_PREFIX + "*").count(200).build())) {
+                    ScanOptions.scanOptions().match(ORDER_KEY_PREFIX + "*").count(200).build())) {
                 while (cursor.hasNext()) {
                     keys.add(new String(cursor.next(), StandardCharsets.UTF_8));
                 }
@@ -155,23 +157,25 @@ public class SeckillReconciliationTask {
     /**
      * Phase 1 + Phase 2：对单个券的占坑集合做比对与裁决
      */
-    private void reconcileVoucher(String setKey) {
+    private void reconcileVoucher(String orderKey) {
         //
         Long voucherId;
         try {
-            voucherId = Long.parseLong(setKey.substring(ORDER_SET_PREFIX.length()));
+            voucherId = Long.parseLong(orderKey.substring(ORDER_KEY_PREFIX.length()));
         } catch (NumberFormatException e) {
-            log.warn("[秒杀对账] 无法从 key 解析券 id，跳过: {}", setKey);
+            log.warn("[秒杀对账] 无法从 key 解析券 id，跳过: {}", orderKey);
             return;
         }
-        //作用：获取占坑集合中的所有用户 ID 字符串
-        Set<String> members = stringRedisTemplate.opsForSet().members(setKey);
-        if (members == null || members.isEmpty()) {
+        // 占坑 Hash：field=userId，value=字符串 orderId；保留 DB 是否已成功落单的判断
+        Map<Object, Object> entries = stringRedisTemplate.opsForHash().entries(orderKey);
+        if (entries.isEmpty()) {
             return;
         }
-        //作用：将占坑集合中的字符串转换为 Long 类型的用户 ID 列表
-        List<Long> memberIds = members.stream().map(Long::parseLong).collect(Collectors.toList());
-        // 每券一次 IN 查询（唯一索引 uk_user_voucher 点查），得「已落单用户集」
+        Map<Long, String> reservationOrderIds = new HashMap<>();
+        for (Map.Entry<Object, Object> entry : entries.entrySet()) {
+            reservationOrderIds.put(Long.parseLong(entry.getKey().toString()), entry.getValue().toString());
+        }
+        List<Long> memberIds = new ArrayList<>(reservationOrderIds.keySet());
         Set<Long> orderedUserIds = voucherOrderService.query()
                 .eq("voucher_id", voucherId)
                 .in("user_id", memberIds)
@@ -180,13 +184,15 @@ public class SeckillReconciliationTask {
                 .map(VoucherOrder::getUserId)
                 .collect(Collectors.toSet());
 
-        for (Long userId : memberIds) {
+        for (Map.Entry<Long, String> reservation : reservationOrderIds.entrySet()) {
+            Long userId = reservation.getKey();
+            String orderId = reservation.getValue();
             if (orderedUserIds.contains(userId)) {
-                // 账实相符；顺手清掉可能的旧嫌疑（虚惊收尾）
-                stringRedisTemplate.delete(suspectKey(voucherId, userId));
+                // 只清理当前订单的嫌疑，不能误删同用户其他订单的嫌疑
+                stringRedisTemplate.delete(suspectKey(voucherId, userId, orderId));
                 continue;
             }
-            judgeSuspect(voucherId, userId);
+            judgeSuspect(voucherId, userId, orderId);
         }
     }
 
@@ -210,9 +216,9 @@ public class SeckillReconciliationTask {
     /**
      * Phase 3：两阶段裁决单个"占坑无单"用户
      */
-    private void judgeSuspect(Long voucherId, Long userId) {
-        //作用：根据占坑集合 key 和用户 ID 生成嫌疑 key
-        String suspectKey = suspectKey(voucherId, userId);
+    private void judgeSuspect(Long voucherId, Long userId, String orderId) {
+        // 嫌疑按订单隔离，旧订单的更新和清理不会影响同用户的新订单
+        String suspectKey = suspectKey(voucherId, userId, orderId);
         //作用：获取嫌疑 key 对应的值（记录首次见时间）
         String firstSeen = stringRedisTemplate.opsForValue().get(suspectKey);
         long now = System.currentTimeMillis();
@@ -235,21 +241,18 @@ public class SeckillReconciliationTask {
         log.error("[秒杀对账][告警] 确认漂移: vid={}, uid={}, 首见于 {}ms 前，执行补偿",
                 voucherId, userId, elapsed);
         try {
-            // 幂等补偿：rollbackToken 用对账维度合成令牌；
-            // 若用户已被其他路径回滚，SISMEMBER 守卫会拦截（返回 false），同样视为已了结
-            voucherOrderService.rollbackSeckill("recon:" + voucherId + ":" + userId, voucherId, userId);
-            // 补偿调用成功返回（含被幂等拦截）后清理嫌疑；若抛异常则不清理，下轮重试
+            // 只有当前占坑仍属于该 orderId 才允许补偿；token 继续负责同路径幂等
+            voucherOrderService.rollbackSeckill("recon:" + voucherId + ":" + userId,
+                    voucherId, userId, orderId);
+            // suspect key 含 orderId，清理旧订单嫌疑不会删除新订单嫌疑
             stringRedisTemplate.delete(suspectKey);
         } catch (Exception e) {
             log.error("[秒杀对账] 补偿执行失败，保留嫌疑待下轮重试: vid={}, uid={}", voucherId, userId, e);
         }
     }
 
-    /**
-     * 生成嫌疑 key：占坑集合 key + ":" + 用户 ID
-     */
-    //作用：根据占坑集合 key 和用户 ID 生成嫌疑 key
-    private String suspectKey(Long voucherId, Long userId) {
-        return RedisConstants.SECKILL_RECON_SUSPECT_KEY + voucherId + ":" + userId;
+    /** 嫌疑 key 绑定订单，旧订单 suspect 只按 TTL 自然清理，不覆盖新订单 */
+    private String suspectKey(Long voucherId, Long userId, String orderId) {
+        return RedisConstants.SECKILL_RECON_SUSPECT_KEY + voucherId + ":" + userId + ":" + orderId;
     }
 }
