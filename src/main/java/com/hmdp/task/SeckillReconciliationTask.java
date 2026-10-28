@@ -76,12 +76,27 @@ public class SeckillReconciliationTask {
     private IVoucherOrderService voucherOrderService;
     @Resource
     private ISeckillVoucherService seckillVoucherService;
+    @Resource
+    private SeckillActivityRedisInitializer seckillActivityRedisInitializer;
 
     @Scheduled(fixedDelay = 60_000, initialDelay = 60_000)//每 60 秒执行一次，应用启动后 60 秒后开始，避免还没就绪的窗口
     /**
      * 秒杀定时对账任务（anti-entropy）：兜住所有"Redis 已占坑、DB 永无订单"的静默漂移
      */
     public void reconcile() {
+        // 0.静态状态补齐：只补时间键；库存缺失只告警，不自动重灌。
+        // 放在守卫之前：时间键是静态配置，任何时刻补齐都安全。
+        // 结果日志由 SeckillActivityRedisInitializer 统一输出，这里只负责逐券隔离。
+        List<SeckillVoucher> vouchers = seckillVoucherService.list();
+        for (SeckillVoucher voucher : vouchers) {
+            try {
+                seckillActivityRedisInitializer.repairStaticState(voucher);
+            } catch (Exception e) {
+                // 双保险：单券异常不得中断后续券的检查
+                log.error("[秒杀对账] 单券处理异常，继续后续: vid={}", voucher.getVoucherId(), e);
+            }
+        }
+
         //作用：确保"占坑 + 无单"只可能是漂移而非在途
         if (!guardsPassed()) {
             return;
@@ -90,7 +105,7 @@ public class SeckillReconciliationTask {
         // （漂移已自愈、Redis 数据丢失）不在下方 SCAN 范围内，只有 DB 能枚举出它们
         //对 DB 里的 每一张秒杀券 ，比较`Redis 库存` 和`DB 库存` 是否相等。
         // 它的覆盖范围天然是“全部券”，不依赖任何 Redis key 是否存在。
-        for (SeckillVoucher voucher : seckillVoucherService.list()) {
+        for (SeckillVoucher voucher : vouchers) {
             try {
                 assertBaseline(voucher.getVoucherId(), voucher.getStock());
             } catch (Exception e) {

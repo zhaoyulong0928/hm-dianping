@@ -20,9 +20,18 @@ local endKey = 'seckill:end:' .. voucherId
 -- 2.5.用户级限流key
 local freqKey = 'seckill:freq:' .. userId
 
--- 3.用户级限流：每用户每秒最多放行 1 次（固定窗口 INCR + EXPIRE），超限返回 5
--- 放在所有校验之前：同一用户并行/高频的脚本请求（如同一瞬间并行抢多张券），
--- 在时间/库存/一人一单判断之前直接被拒，不产生任何业务写操作
+-- 3.状态就绪检查（放在限流之前：未就绪不消耗用户限流额度）
+-- 必要 key 缺失或值无法转数字时直接拒绝，不再因为时间 key 缺失而跳过时间约束
+local beginTime = tonumber(redis.call('get', beginKey))
+local endTime = tonumber(redis.call('get', endKey))
+local stock = tonumber(redis.call('get', stockKey))
+if not beginTime or not endTime or not stock then
+    -- 活动未就绪，返回6
+    return 6
+end
+
+-- 4.用户级限流：每用户每秒最多放行 1 次（固定窗口 INCR + EXPIRE），超限返回 5
+-- 同一用户并行/高频的脚本请求在业务校验之前直接被拒，不产生任何业务写操作
 local freqCnt = tonumber(redis.call('incr', freqKey))
 if freqCnt == 1 then
     redis.call('expire', freqKey, 1)
@@ -31,33 +40,31 @@ if freqCnt > 1 then
     return 5
 end
 
--- 4.校验秒杀时间（用 Redis 服务端时间，避免各应用服务器时钟不一致）
--- 4.1.秒杀尚未开始，返回3
+-- 5.校验秒杀时间（用 Redis 服务端时间，避免各应用服务器时钟不一致）
+-- 5.1.秒杀尚未开始，返回3
 local now = tonumber(redis.call('time')[1])
-local beginTime = tonumber(redis.call('get', beginKey))
-if(beginTime and now < beginTime) then
+if now < beginTime then
     return 3
 end
--- 4.2.秒杀已经结束，返回4
-local endTime = tonumber(redis.call('get', endKey))
-if(endTime and now > endTime) then
+-- 5.2.秒杀已经结束，返回4
+if now > endTime then
     return 4
 end
 
--- 5.脚本业务
--- 5.1.判断库存是否充足 get stockKey（key 不存在时视为 0，避免 tonumber(nil) 报错）
-if(tonumber(redis.call('get', stockKey) or 0) <= 0) then
-    -- 5.2.库存不足，返回1
+-- 6.脚本业务
+-- 6.1.判断库存是否充足（stock 来自就绪检查，key 必然存在且可转数字）
+if stock <= 0 then
+    -- 6.2.库存不足，返回1
     return 1
 end
--- 5.3.判断用户是否下单：Hash field=userId，value=字符串 orderId
+-- 6.3.判断用户是否下单：Hash field=userId，value=字符串 orderId
 if(redis.call('hexists', orderKey, userId) == 1) then
-    -- 5.4.存在，说明是重复下单，返回2
+    -- 6.4.存在，说明是重复下单，返回2
     return 2
 end
--- 5.5.扣库存 incrby stockKey -1
+-- 6.5.扣库存 incrby stockKey -1
 redis.call('incrby', stockKey, -1)
--- 5.6.保存占坑及订单归属；orderId 保持字符串，不转数值
+-- 6.6.保存占坑及订单归属；orderId 保持字符串，不转数值
 redis.call('hset', orderKey, userId, orderId)
--- 5.7.秒杀成功返回0（下单消息改由 Java 侧投递到 RabbitMQ）
+-- 6.7.秒杀成功返回0（下单消息改由 Java 侧投递到 RabbitMQ）
 return 0

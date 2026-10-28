@@ -84,6 +84,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         int r = result.intValue();
         // 4.判断结果是否为0
         if (r != 0) {
+            if (r == 6) {
+                // 必要 key 缺失/非法：活动尚未完成 Redis 初始化，直接拒绝
+                return Result.fail("活动未就绪，请稍后再试");
+            }
             if (r == 3) {
                 return Result.fail("秒杀尚未开始");
             }
