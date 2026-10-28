@@ -79,8 +79,11 @@ git diff master feature/refactor
 - [x] 秒杀并发一致性测试：防超卖（100 库存 / 1000 并发）+ 重复消息幂等（同一(用户,券) 5 条消息只落 1 单）（`SeckillConcurrencyTest`）
 - [x] 秒杀两阶段基线测试：真实 HTTP 全链路、时间/库存边界、重复抢购、并发防超卖、重复消息、事务回滚、消费重试/死信、补偿与对账
 - [x] 秒杀旧补偿竞态修复回归：原失败用例保持断言不变并转为通过，两阶段受影响用例 + 新增 suspect 隔离共 14 项针对性回归通过
+- [x] 秒杀活动 Redis 初始化一致性：数据库提交后经 `afterCommit` 发布（时间键先写、库存最后写），Lua 新增「活动未就绪」返回码 6；对账仅补静态时间键，库存缺失/不一致只告警；首次初始化失败、回调前崩溃、进行中库存丢失保留人工恢复边界
 
 ## 改造记录
+
+> 维护约定：每次推送到远程前，同步更新「改造计划」勾选项与本节记录，保持 README 与实际代码一致。
 
 | 日期 | 内容 |
 | --- | --- |
@@ -104,3 +107,4 @@ git diff master feature/refactor
 | 2026-10-17 | 秒杀消费端占坑双检：封死「对账误补偿 × 在途落库」竞态——极端在途（DB 行锁等待 50s×3 次 ≈ 153s）可超过对账 60s 宽限期，且 `getQueueInfo().getMessageCount()`（AMQP passive declare 语义）不含已投递未 ack 消息导致守卫放行，误补偿先执行、卡顿消费者醒来后落库，会制造「有单无占坑 + Redis 基线 +1」的幽灵库存：秒杀尾部沦为「lua 过 → DB 拒 → 就地补偿」的假成功死循环，而对账单向扫描（占坑集合→DB 订单）对该反向漂移永久不可见。修复：`createVoucherOrder` 落库前资格预检（占坑已被补偿回滚则跳过落库直接 ack）+ `onOrderMessage` 落库成功后、事务提交前终检（消费期间被补偿则 `setRollbackOnly` 撤销订单与扣库存、正常 ack——资格已退还用户可重新下单，重试无意义）；两检合围补偿可能发生的全部时序（消费前/消费中），正常路径零影响（合法消息占坑恒在），终检与终态失败路径同用 `setRollbackOnly` 模式；对账任务设计注释同步修正「在途上限 ≈ 10s」的不实估算，改为记录分层防御关系（`VoucherOrderServiceImpl` / `SeckillReconciliationTask`，另含对账任务与回滚脚本的学习注释补充） |
 | 2026-10-24 | 秒杀消费端删除冗余 Redisson 分布式锁：Lua 的 `SISMEMBER+SADD` 已原子拦截同(用户,券)重复请求，落库重复由 `uk_user_voucher` 唯一索引抛 `DuplicateKeyException` 兜底；原「抢锁失败即 return」分支会在持锁消息重试耗尽进死信时静默吞消息，故移除。保留 `count` 前置判重以减少无效 INSERT；新增 `SeckillConcurrencyTest`（100 库存/1000 并发防超卖 + 5 条重复消息只落 1 单）（`VoucherOrderServiceImpl` / `SeckillConcurrencyTest`） |
 | 2026-10-26 | 秒杀补偿增加订单归属校验：第二阶段确定性测试复现「旧请求预扣 → 首次补偿 → 同用户重新抢购 → 另一旧路径 token 迟到」导致 Redis 库存多恢复 1、新占坑被误删；根因是 Set 占坑只保存 userId，而 token 只能做补偿来源幂等，不能证明当前占坑归属。最小修复为占坑改 Hash（field=userId、value=字符串 orderId），`rollbackSeckill` 增加 `expectedOrderId`，并在同一个 `rollbackSeckill.lua` 中完成 `HGET` 字符串比对、`SET NX EX`、`INCRBY + HDEL`；对账 suspect key 追加 orderId，独立记录新旧订单宽限期和清理范围，保留 DB 是否已成功落单的判断。原失败用例未改弱断言，修复后返回 false、stock=0、占坑保留；第一阶段 8 项 + 第二阶段原有 5 项 + 新增 suspect 隔离 1 项，共 14 项针对性回归实际通过（`seckill.lua` / `rollbackSeckill.lua` / `IVoucherOrderService` / `VoucherOrderServiceImpl` / `SeckillReconciliationTask` / `RedisConstants`；报告见 `seckill-phase1-baseline-report.md` / `seckill-phase2-baseline-report.md` / `seckill-compensation-fix-report.md`，面试复盘见 `seckill-stale-compensation-interview.md`）。仅在空的专用 Redis 完成类型切换，未验证已有 Set/旧 suspect 在线迁移，不宣称解决全部竞态或达到生产级可靠性 |
+| 2026-10-28 | 秒杀活动 Redis 初始化一致性：`addSeckillVoucher` 改为数据库提交后通过 `TransactionSynchronization#afterCommit` 发布 Redis 状态，时间键先写、库存键最后写且全部 `setIfAbsent`；Controller 与 Service 双重校验起止时间/库存，事务前提在写库前快速失败。新增 `SeckillActivityRedisInitializer` 封装首次发布与静态补齐，异常统一在公共入口捕获并返回 `PublishResult`；`seckill.lua` 增加必要 key 就绪检查（缺 key/非法值返回 6，`stock=0` 仍返回 1），限流保持在就绪检查之后；对账在守卫前仅补静态时间键，库存缺失/不一致只告警，不自动重灌。新增 `SeckillActivityRedisInitializerTest` / `SeckillReconciliationTaskIsolationTest` / `SeckillActivityInitIntegrationTest` / `SeckillActivityInitFailureTest`。独立环境验收：单测 9 项、新增集成 10 项、既有回归 8 项、边界 5 项、HTTP 1 项、调度隔离 1 项、Lua 16 项断言全部通过；验收报告与日志在本地留存（未纳入仓库）。边界：首次初始化失败不自动恢复可售，`afterCommit` 前进程崩溃仍可能缺状态，进行中库存丢失需人工受控恢复，未引入 outbox/任务表/延迟重试 |
