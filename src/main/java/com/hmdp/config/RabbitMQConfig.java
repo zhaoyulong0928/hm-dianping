@@ -177,13 +177,14 @@ public class RabbitMQConfig {
          * • correlationData ：消息的关联标识，用于定位到底是哪一条消息发送失败
          * • cause ：失败原因（若有）
          */
-        // 发送方确认（publisher confirm）：broker 未确认时记录日志
+        // 发送方确认（publisher confirm）：broker 未确认时记录日志，nack
         template.setConfirmCallback((correlationData, ack, cause) -> {
             if (!ack) {
                 log.error("消息未确认: correlationData={}, cause={}", correlationData, cause);
             }
         });
         // 消息无法路由到队列时触发（spring-amqp 2.2 使用 ReturnCallback）
+        // 这个时候消息实际没进队列，Redis 的预扣却已经发生，这个缺口由对账任务兜底。
         template.setReturnCallback((message, replyCode, replyText, exchange, routingKey) -> log.error(
                 "消息路由失败: message={}, replyCode={}, replyText={}, exchange={}, routingKey={}",
                 message, replyCode, replyText, exchange, routingKey));
@@ -192,7 +193,7 @@ public class RabbitMQConfig {
 
     // ============ 重试拦截器：失败重试 N 次后拒绝不重回队列 → 进入死信队列 ============
     /*
-     * 监听方法抛异常
+     * 监听方法抛异常，重试拦截器只有一种触发条件：消费方法抛出异常，而且这个异常没有被方法内部的`catch` 吞掉。
      * ↓
      * 重试拦截器重试“消费业务方法”
      * ↓
